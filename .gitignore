@@ -1,0 +1,12 @@
+# Token do Mercado Livre — NUNCA versionar
+mcp-tokens/
+*.token.json
+.token.json
+
+# Backups de ofertas
+ofertas-*.json
+*.bak
+
+# Python
+__pycache__/
+*.pyc
