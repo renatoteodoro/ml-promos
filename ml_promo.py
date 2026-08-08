@@ -17,7 +17,7 @@ import sys, os, json, time, hmac, hashlib, argparse, urllib.request, urllib.pars
 # Gere um link de afiliado e copie o formato:
 #   Se o link tiver "matt_word=X&matt_tool=Y" → tag = "matt:X:Y"
 #   Se o link tiver "tag=X-20"               → tag = "X-20"
-AFF_TAG = "COLE_SUA_TAG_AQUI"
+AFF_TAG = "matt:renatoteodoro:94885465"
 
 # Nichos padrão (usado se você não passar --nicho)
 NICHOS_PADRAO = "cama pet;ração pet;brinquedo pet;comedouro pet;arranhador;casinha pet"
