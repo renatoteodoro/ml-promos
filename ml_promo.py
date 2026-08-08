@@ -80,12 +80,14 @@ def link_afiliado(permalink):
     return permalink
 
 def enviar_webhook(ofertas):
-    """Envia as ofertas ao JARVIS via webhook com assinatura HMAC."""
+    """Envia as ofertas ao JARVIS via webhook com assinatura HMAC V2 (com timestamp)."""
     payload = json.dumps({"ofertas": ofertas, "gerado_em": time.strftime("%Y-%m-%d %H:%M")}).encode()
-    signature = hmac.new(WEBHOOK_SECRET.encode(), payload, hashlib.sha256).hexdigest()
+    ts = str(int(time.time()))
+    signature = hmac.new(WEBHOOK_SECRET.encode(), ts.encode() + b"." + payload, hashlib.sha256).hexdigest()
     req = urllib.request.Request(WEBHOOK_URL, data=payload, headers={
         "Content-Type": "application/json",
-        "X-Webhook-Signature": f"sha256={signature}",
+        "X-Webhook-Signature-V2": signature,
+        "X-Webhook-Timestamp": ts,
     })
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
