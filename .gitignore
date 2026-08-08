@@ -10,3 +10,4 @@ ofertas-*.json
 # Python
 __pycache__/
 *.pyc
+mcp-tokens/
