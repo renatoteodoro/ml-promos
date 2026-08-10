@@ -1,0 +1,455 @@
+#!/usr/bin/env python3
+"""
+Executor diário "Promo das Galáxias" — busca 102 ofertas reais, gera cards,
+agenda e envia as 100 postagens nos horários exatos do roteiro.
+
+Fluxo:
+1. Busca ofertas do dia (paginação /ofertas até 102+ únicas)
+2. Gera card para cada oferta (Playwright, batch)
+3. Gera links meli.la via Gerador de Links do portal (sessão salva)
+4. Agenda os 100 envios nos horários do roteiro (asyncio)
+5. Envia card+texto (posts 2-99) e texto puro (posts 1 e 100)
+
+Uso: python3 ml_executor_diario.py [--dry-run] [--forcar-horario HH:MM]
+"""
+import os, sys, json, time, asyncio, argparse, subprocess, datetime, re, fcntl
+
+REPO = os.path.expanduser("~/ml-promos-repo")
+VENV_PY = os.path.expanduser("~/.hermes/hermes-agent/venv/bin/python3")
+DIVULGACAO = os.path.expanduser("~/divulgacao")
+GRUPO = "120363428591609827@g.us"
+BRIDGE = "http://127.0.0.1:3000"
+
+sys.path.insert(0, REPO)
+from ml_promo import extrair_ofertas_html
+from ml_roteiro_diario import HORARIOS, construir_roteiro
+from ml_metrica import filtrar_por_metrica, carregar_historico, registrar_posts, resumo_metrica
+from ml_compare_preco import enriquecer_lote
+from ml_detectar_cupons import processar as detectar_cupons_lote
+
+def buscar_98_ofertas():
+    """Busca ofertas únicas paginando /ofertas até 102+ (14 páginas p/ ter variedade de preço)."""
+    todas, links_vistos = [], set()
+    for pg in range(1, 15):
+        try:
+            ofs = extrair_ofertas_html(f"https://www.mercadolivre.com.br/ofertas?page={pg}")
+        except Exception as e:
+            print(f"  ⚠️ Página {pg}: {e}")
+            break
+        novas = [o for o in ofs if o["link"] not in links_vistos]
+        for o in novas:
+            links_vistos.add(o["link"])
+        todas.extend(novas)
+        print(f"  Página {pg}: +{len(novas)} (total {len(todas)})")
+        if len(todas) >= 300:
+            break
+        time.sleep(0.5)
+    return todas
+
+def gerar_cards_batch(ofertas):
+    """Gera cards para todas as ofertas (uma sessão Playwright)."""
+    import base64, urllib.request
+    from playwright.sync_api import sync_playwright
+
+    cards = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page(viewport={"width": 1080, "height": 1080})
+        for i, oferta in enumerate(ofertas):
+            try:
+                # Baixar foto
+                foto_url = oferta.get("imagem", "")
+                foto_b64 = ""
+                if foto_url:
+                    req = urllib.request.Request(foto_url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(req, timeout=15) as r:
+                        foto_b64 = base64.b64encode(r.read()).decode()
+                desconto = oferta.get("desconto", 0)
+                frete = oferta.get("frete_gratis", False)
+                badge = f'<span style="position:absolute;top:36px;right:36px;background:#e94560;color:#fff;font-size:64px;font-weight:800;padding:18px 36px;border-radius:20px;font-family:Segoe UI,sans-serif">-{desconto}%</span>' if desconto else ""
+                frete_html = f'<div style="position:absolute;bottom:40px;left:40px;background:#1a7f3f;color:#fff;font-size:40px;font-weight:700;padding:14px 28px;border-radius:16px;font-family:Segoe UI,sans-serif">🚚 FRETE GRÁTIS</div>' if frete else ""
+                html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>*{{margin:0;padding:0;box-sizing:border-box}}body{{background:#fff}}.card{{width:1080px;height:1080px;position:relative;overflow:hidden;display:flex;align-items:center;justify-content:center}}img{{width:100%;height:100%;object-fit:contain;padding:60px}}</style></head><body><div class="card">{f'<img src="data:image/png;base64,{foto_b64}">' if foto_b64 else '<div style="font-size:60px">📦</div>'}{badge}{frete_html}</div></body></html>"""
+                page.set_content(html, wait_until="load")
+                page.wait_for_timeout(300)
+                path = os.path.join(DIVULGACAO, f"card_dia_{i+1:02d}.png")
+                page.screenshot(path=path)
+                cards.append(path)
+                print(f"  ✅ Card {i+1}: {os.path.basename(path)}")
+            except Exception as e:
+                print(f"  ⚠️ Card {i+1} falhou: {e}")
+                cards.append(None)
+        browser.close()
+    return cards
+
+def carregar_cookies_portal():
+    """Carrega os cookies do portal (salvos via Cookie-Editor) no formato Playwright."""
+    import json as _json
+    cookies_path = os.path.expanduser("~/.hermes/ml-affiliate/cookies_portal.json")
+    if not os.path.exists(cookies_path):
+        return []
+    with open(cookies_path) as f:
+        cookies = _json.load(f)
+    pw = []
+    for c in cookies:
+        ss = c.get("sameSite") or "Lax"
+        ss = {"no_restriction": "None", "lax": "Lax", "strict": "Strict"}.get(ss, "Lax")
+        item = {"name": c["name"], "value": c["value"], "domain": c["domain"], "path": c.get("path", "/"),
+                "secure": c.get("secure", False), "httpOnly": c.get("httpOnly", False), "sameSite": ss}
+        if c.get("expirationDate"):
+            item["expires"] = c["expirationDate"]
+        pw.append(item)
+    return pw
+
+def gerar_links_meli_batch(ofertas):
+    """Gera links meli.la para TODAS as ofertas de uma vez (batch no Gerador de Links)."""
+    import re as _re
+    USER_DATA_DIR = os.path.expanduser("~/.hermes/ml-affiliate/chromium-data")
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        ctx = p.chromium.launch_persistent_context(
+            USER_DATA_DIR, headless=True, viewport={"width": 1280, "height": 900},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            locale="pt-BR", args=["--disable-blink-features=AutomationControlled"])
+        page = ctx.new_page()
+        # INJETAR COOKIES DO PORTAL (sessão salva via Cookie-Editor — expira ~30 dias)
+        cookies = carregar_cookies_portal()
+        if cookies:
+            page.goto("https://www.mercadolivre.com.br", timeout=30000, wait_until="domcontentloaded")
+            ctx.add_cookies(cookies)
+            print(f"  🔐 {len(cookies)} cookies do portal injetados")
+        page.goto("https://www.mercadolivre.com.br/afiliados/hub?is_affiliate=true", timeout=45000, wait_until="domcontentloaded")
+        page.wait_for_timeout(10000)
+
+        el = page.query_selector("text=Gerador de links")
+        if el:
+            el.click(force=True)
+            page.wait_for_timeout(8000)
+
+        ta = page.query_selector("textarea:visible")
+        if not ta:
+            print("  ❌ Textarea do gerador não encontrado")
+            ctx.close()
+            return [None]*len(ofertas)
+
+        # Colar TODAS as URLs de uma vez (separadas por linha)
+        urls = "\n".join(o["link"] for o in ofertas)
+        ta.fill(urls)
+        page.wait_for_timeout(2000)
+        btn = page.query_selector("button:has-text('Gerar')")
+        if btn:
+            btn.click(force=True)
+            print(f"  🔗 Gerando {len(ofertas)} links...")
+            # Geração em batch — aguardar até 4 min
+            for _ in range(8):
+                page.wait_for_timeout(30000)
+                vals = page.eval_on_selector_all("input, textarea", "els => els.map(e => e.value || e.textContent).filter(v => v && v.includes('meli.la'))")
+                texts_all = page.eval_on_selector_all("body *", "els => els.filter(e => e.children.length === 0).map(e => e.textContent).filter(t => t && t.includes('meli.la'))")
+                hrefs = page.eval_on_selector_all("a", "els => els.map(e => e.href).filter(h => h && h.includes('meli.la'))")
+                todos = vals + texts_all + hrefs
+                links = []
+                vistos = set()
+                for v in todos:
+                    for m in _re.findall(r'https?://meli\.la/\w+', v):
+                        if m not in vistos:
+                            vistos.add(m)
+                            links.append(m)
+                print(f"    ...{len(links)}/{len(ofertas)} links")
+                if len(links) >= len(ofertas):
+                    break
+        ctx.close()
+        if 'links' not in dir():
+            return [None]*len(ofertas)
+        if len(links) < len(ofertas):
+            print(f"  ⚠️ Só {len(links)} links gerados de {len(ofertas)}")
+        return links
+
+async def enviar(chat, file_path, caption):
+    """Envia card+caption ou só texto via bridge."""
+    import urllib.request
+    if file_path and os.path.exists(file_path):
+        payload = json.dumps({"chatId": chat, "filePath": file_path, "mediaType": "image", "caption": caption}).encode()
+        req = urllib.request.Request(f"{BRIDGE}/send-media", data=payload, headers={"Content-Type": "application/json"})
+    else:
+        payload = json.dumps({"chatId": chat, "message": caption}).encode()
+        req = urllib.request.Request(f"{BRIDGE}/send", data=payload, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, r.read().decode()[:100]
+    except Exception as e:
+        return 500, str(e)
+
+async def agendar_envios(posts, dry_run=False, forcar=None, revisar_apos=None):
+    """Agenda e envia os posts nos horários exatos. revisar_apos=num do post p/ revisão automática."""
+    agora = datetime.datetime.now()
+    enviados = 0
+    revisado = False
+    for post in posts:
+        hh, mm = map(int, post["horario"].split(":"))
+        alvo = agora.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if forcar:
+            fhh, fmm = map(int, forcar.split(":"))
+            alvo = agora.replace(hour=fhh, minute=fmm, second=0, microsecond=0)
+        if alvo <= agora and not forcar:
+            print(f"  ⏭️ Post {post['num']} ({post['horario']}) — horário já passou, pulando")
+            continue
+        espera = (alvo - datetime.datetime.now()).total_seconds()
+        if espera > 0 and not dry_run:
+            print(f"  ⏳ Post {post['num']} ({post['horario']}): aguardando {espera/60:.1f} min...")
+            await asyncio.sleep(espera)
+        elif espera > 0 and dry_run:
+            print(f"  ⏳ Post {post['num']} ({post['horario']}): aguardaria {espera/60:.1f} min (dry-run, sem esperar)")
+        if dry_run:
+            tipo = "TEXTO" if post["card"] is None else "CARD+TEXTO"
+            print(f"  🧪 [DRY] Post {post['num']} {post['horario']} [{tipo}]: {post['texto'][:70]}...")
+        else:
+            status, resp = await enviar(GRUPO, post["card"], post["texto"])
+            ok = "✅" if status == 200 else "❌"
+            print(f"  {ok} Post {post['num']} ({post['horario']}): HTTP {status} {resp[:60]}")
+            if status != 200:
+                print(f"     texto: {post['texto'][:120]}")
+        enviados += 1
+
+        # REVISÃO AUTOMÁTICA após o primeiro post de oferta do dia
+        if revisar_apos and not revisado and post["num"] == revisar_apos and not dry_run:
+            revisado = True
+            print(f"\n  🔍 REVISÃO pós-post {revisar_apos}...")
+            try:
+                json_path = os.path.expanduser(f"~/divulgacao/roteiro_{datetime.date.today().isoformat()}.json")
+                r = subprocess.run([VENV_PY, os.path.join(REPO, "ml_revisao_post.py"), "--json", json_path, "--post", str(revisar_apos)],
+                                   capture_output=True, text=True, timeout=150)
+                saida = (r.stdout or "") + (r.stderr or "")
+                print(f"  {saida[-600:]}")
+                if r.returncode != 0:
+                    print(f"  ⚠️ REVISÃO: problemas encontrados no Post {revisar_apos}!")
+                else:
+                    print(f"  ✅ REVISÃO OK: Post {revisar_apos} validado (card + link + texto)")
+            except Exception as e:
+                print(f"  ⚠️ Revisão falhou: {str(e)[:80]}")
+
+    # Registrar links postados no histórico (anti-repetição para amanhã)
+    if not dry_run:
+        links_postados = [p.get("texto", "").split("🔗 ")[-1].strip() for p in posts if p.get("tipo") == "oferta" and "🔗 " in p.get("texto", "")]
+        n = registrar_posts(links_postados)
+        print(f"🗂️ {n} links registrados no histórico (anti-repetição)")
+
+    print(f"\n🏁 Concluído: {enviados} posts processados")
+
+def adquirir_lock():
+    """Lock de instância única (fcntl flock) — impede 2 executores no mesmo dia.
+
+    Causa raiz das duplicações/perdas de 10/08: 3 execuções no mesmo dia (A/B/C)
+    por relançamento manual. Com o flock, uma 2ª execução aborta na hora.
+    """
+    lock_path = os.path.join(DIVULGACAO, "executor.lock")
+    lock_file = open(lock_path, "a+")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("🚫 JÁ EXISTE um executor rodando (lock ativo). Abortando para evitar posts duplicados/perdidos.")
+        print("   Se o relançamento for intencional, mate o processo anterior primeiro:")
+        print("   pgrep -af ml_executor_diario  →  kill <PID>")
+        sys.exit(2)
+    lock_file.write(f"{os.getpid()} {datetime.datetime.now().isoformat()}\n")
+    lock_file.flush()
+    return lock_file
+
+
+def deduplicar_por_slug(ofertas):
+    """
+    Remove produtos duplicados do MESMO item do ML (mesmo slug de URL, anúncios diferentes).
+    Mantém o de MAIOR desconto; empate → menor preço. (Correção 10/08, revisão GLM-5.2)
+    """
+    import re as _re
+    def slug(link):
+        m = _re.search(r"mercadolivre\.com\.br/([^/?]+)", link or "")
+        return m.group(1) if m else (link or "")
+    vistos = {}
+    for o in ofertas:
+        s = slug(o.get("link", ""))
+        if not s:
+            continue
+        if s in vistos:
+            atual = vistos[s]
+            desc_atual = atual.get("desconto") or 0
+            desc_novo = o.get("desconto") or 0
+            # Manter maior desconto; empate → menor preço
+            if desc_novo > desc_atual or (desc_novo == desc_atual and o.get("preco", 9e9) < atual.get("preco", 0)):
+                vistos[s] = o
+        else:
+            vistos[s] = o
+    return list(vistos.values())
+
+
+def deduplicar_por_titulo(ofertas):
+    """
+    Segunda camada: mesmo produto com MLB IDs DIFERENTES (variações de cor/tamanho do mesmo item)
+    têm títulos iguais. Remove duplicatas por título normalizado, mantendo maior desconto.
+    (Correção 10/08 — caso Cadeira Gamer: cor branca vs cinza, MLB60051562 vs MLB64060677)
+    """
+    import re as _re
+    def normalizar(t):
+        t = (t or "").lower()
+        t = _re.sub(r"[^a-z0-9 ]", " ", t)
+        t = _re.sub(r"\s+", " ", t).strip()
+        # Cortar em marcadores de variação (cor/tamanho/modelo) — mesmo produto, variação diferente
+        for marcador in [" cor ", " tamanho ", " modelo ", " cor:", " cor "] + [" cor"]:
+            idx = t.find(marcador)
+            if 0 < idx < len(t) - 3:
+                t = t[:idx]
+                break
+        return t.strip()
+    vistos = {}
+    for o in ofertas:
+        n = normalizar(o.get("titulo", ""))
+        if not n:
+            continue
+        if n in vistos:
+            atual = vistos[n]
+            desc_atual = atual.get("desconto") or 0
+            desc_novo = o.get("desconto") or 0
+            if desc_novo > desc_atual or (desc_novo == desc_atual and o.get("preco", 9e9) < atual.get("preco", 0)):
+                vistos[n] = o
+        else:
+            vistos[n] = o
+    return list(vistos.values())
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true", help="Não envia, só mostra")
+    ap.add_argument("--forcar-horario", default="", help="Envia tudo agora com este horário")
+    ap.add_argument("--so-buscar", action="store_true", help="Só busca ofertas e salva JSON")
+    ap.add_argument("--so-cards", action="store_true", help="Só gera cards (usa JSON salvo)")
+    ap.add_argument("--so-links", action="store_true", help="Só gera links meli.la (usa JSON salvo)")
+    ap.add_argument("--so-enviar", action="store_true", help="Só agenda/envia (usa JSON salvo)")
+    args = ap.parse_args()
+
+    # Lock de instância única — aborta se já houver executor rodando
+    _lock_file = adquirir_lock()
+
+    hoje = datetime.date.today().isoformat()
+    json_path = os.path.join(DIVULGACAO, f"roteiro_{hoje}.json")
+
+    if args.so_buscar or (not args.so_cards and not args.so_links and not args.so_enviar and not args.dry_run and not args.forcar_horario):
+        pass  # fluxo completo
+    elif args.so_buscar:
+        pass
+
+    # Fase 1: buscar ofertas (se não tiver JSON ou for fluxo completo)
+    ofertas = []
+    if os.path.exists(json_path) and not args.so_buscar:
+        with open(json_path) as f:
+            dados = json.load(f)
+        ofertas = dados.get("ofertas", [])
+        # DEDUP dupla camada também no JSON salvo (retomada do fluxo)
+        n_antes = len(ofertas)
+        ofertas = deduplicar_por_slug(ofertas)
+        ofertas = deduplicar_por_titulo(ofertas)
+        if len(ofertas) < n_antes:
+            print(f"   🧹 Dedup no JSON: {n_antes - len(ofertas)} duplicatas removidas")
+        print(f"📂 Carregadas {len(ofertas)} ofertas do JSON de {hoje}")
+    else:
+        print("🔍 Buscando ofertas do dia...")
+        ofertas = buscar_98_ofertas()
+        # Aplicar MÉTRICA de preço + anti-repetição (definida 08/08)
+        hist = carregar_historico()
+        ja_postados = set(hist.get("links", {}).keys())
+        ofertas = filtrar_por_metrica(ofertas, n_desejado=102, ja_postados=ja_postados)
+        # DEDUP dupla camada (GLM-5.2 10/08): slug (mesmo item) + título (variações do mesmo produto)
+        n_antes = len(ofertas)
+        ofertas = deduplicar_por_slug(ofertas)
+        ofertas = deduplicar_por_titulo(ofertas)
+        if len(ofertas) < n_antes:
+            print(f"   🧹 Dedup: {n_antes - len(ofertas)} duplicatas do mesmo produto removidas")
+        print(f"✅ {len(ofertas)} ofertas selecionadas pela métrica")
+        resumo = resumo_metrica(ofertas)
+        print(f"   📊 Distribuição: até R$200={resumo['core_50_200']} | R$200-500={resumo['medio_200_500']} | R$500-1000={resumo['oportunidade_500_1000']} | >R$1000={resumo['acima_1000']} | média R$ {resumo['preco_medio']}")
+        # Comparação de preços: buscar MENOR preço do catálogo (vários vendedores)
+        print("🔎 Comparando preços entre vendedores do mesmo produto (catálogo)...")
+        ofertas = enriquecer_lote(ofertas)
+        resumo2 = resumo_metrica(ofertas)
+        print(f"   📊 Após comparação: média R$ {resumo2['preco_medio']} | até R$200={resumo2['core_50_200']}")
+        # Detectar cupons ativos nos produtos (ex: "X% OFF com Cupom")
+        print("🎟️ Verificando cupons ativos nos produtos...")
+        try:
+            ofertas = detectar_cupons_lote(ofertas)
+        except Exception as e:
+            print(f"   ⚠️ Detecção de cupons falhou: {str(e)[:80]} (seguindo sem cupons)")
+        with open(json_path, "w") as f:
+            json.dump({"data": hoje, "ofertas": ofertas, "cards": [], "links": []}, f, ensure_ascii=False, indent=1)
+
+    if len(ofertas) < 102:
+        print(f"⚠️ Só {len(ofertas)} ofertas — roteiro usará repetição")
+
+    # Fase 2: cards (se não existirem)
+    with open(json_path) as f:
+        dados = json.load(f)
+    cards = dados.get("cards") or []
+    if len(cards) < 102 and not args.so_links and not args.so_enviar:
+        print("🖼️ Gerando cards...")
+        cards = gerar_cards_batch(ofertas)
+        dados["cards"] = cards
+        with open(json_path, "w") as f:
+            json.dump(dados, f, ensure_ascii=False, indent=1)
+
+    # Fase 3: links meli.la (se não existirem)
+    links = dados.get("links") or []
+    if len(links) < 102 and not args.so_enviar:
+        print("🔗 Gerando links meli.la...")
+        links = gerar_links_meli_batch(ofertas)
+        # FALLBACK ANTI-INTERRUPÇÃO: se o portal falhar (sessão expirada/captcha),
+        # usar link direto com tag de afiliado (formato oficial, rastreia igual)
+        if len(links) < 102:
+            print(f"⚠️ Só {len(links)} meli.la gerados — completando com links diretos com tag...")
+            for i, o in enumerate(ofertas):
+                if i < len(links) and links[i]:
+                    continue
+                # Extrair MLB id do link original
+                m = re.search(r"/p/(MLB\d+)", o.get("link", ""))
+                if m:
+                    link_tag = f"https://www.mercadolivre.com.br/p/{m.group(1)}?matt_word=renatoteodoro&matt_tool=94885465"
+                    while len(links) <= i:
+                        links.append(None)
+                    links[i] = link_tag
+                else:
+                    while len(links) <= i:
+                        links.append(None)
+                    links[i] = o.get("link", "")
+        dados["links"] = links
+        with open(json_path, "w") as f:
+            json.dump(dados, f, ensure_ascii=False, indent=1)
+        n_meli = sum(1 for l in links if l and "meli.la" in l)
+        print(f"   ✅ {len(links)} links prontos ({n_meli} meli.la + {len(links)-n_meli} diretos com tag)")
+
+    # Vincular links às ofertas
+    for i, o in enumerate(ofertas):
+        if i < len(links) and links[i]:
+            o["link_meli"] = links[i]
+        else:
+            o["link_meli"] = None
+
+    # Fase 4: construir roteiro e agendar
+    dia_idx = hoje.replace("-", "")[-2:]
+    try:
+        dia_idx = int(dia_idx) % 7
+    except:
+        dia_idx = 0
+    chamadas = dados.get("chamadas") or None
+    posts = construir_roteiro(ofertas, hoje, dia_idx, cards=cards, links=links, chamadas=chamadas)
+    print(f"📋 Roteiro montado: {len(posts)} posts ({hoje})")
+
+    # Sanidade: verificar os 3 primeiros posts de oferta (card + link + chamada)
+    for p in posts[1:4]:
+        tem_card = "✅" if p["card"] and os.path.exists(p["card"]) else "❌"
+        link_ok = "meli.la" in p["texto"] if "meli.la" in p["texto"] else "⚠️ link completo"
+        eco_ok = "ECONOMIZE" in p["texto"] if "ECONOMIZE" in p["texto"] else "⚠️ sem economia"
+        print(f"  Post {p['num']}: card {tem_card} | {link_ok} | {eco_ok}")
+
+    # REVISÃO AUTOMÁTICA após o primeiro post de oferta (Post 2, 08:05)
+    # Verifica: card correto (visão Luna) + link meli.la + texto coerente
+    revisar = None if args.so_enviar else 2
+    asyncio.run(agendar_envios(posts, dry_run=args.dry_run, forcar=args.forcar_horario, revisar_apos=revisar))
+
+if __name__ == "__main__":
+    main()

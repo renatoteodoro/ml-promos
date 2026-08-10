@@ -1,0 +1,33 @@
+**Relatório de Análise JARVIS - Bug de Qualidade #7842**
+**Status:** Concluído | **Severidade:** Alta
+
+Olá, Renato. Iniciei a varredura minuciosa dos logs do routine "Promo das Galáxias". Aqui está o diagnóstico detalhado do problema de duplicação:
+
+### 1. Causa Raiz da Duplicação
+A causa raiz é uma falha na valgação de "anúncios distintos para o mesmo item" do Mercado Livre. O ML permite que diferentes vendedores publiquem exatamente o mesmo produto, gerando links base semelhantes, mas com slugs de rastreamento e encurtadores (`https://meli.la/...`) diferentes. 
+O dado reporta `Produtos com MESMO SLUG de URL: {}` (vazio), porém os detalhes mostram claramente URLs base idênticas (`ventilador-de-mesa-30cm-super-power-mondial-60w-vsp-30-b` e `cadeira-de-escritorio-gamer-nitro-ergonomica-estofado-cour`). Isso indica que a função de verificação de slug falhou na extração/normalização ou ignorou a comparação pois confiou 100% no link encurtado do afiliado, que era único.
+
+### 2. Onde Corrigir no Código
+A correção não deve ocorrer na camada de distribuição de posts, mas na **camada de processamento e filtros (pós-extração, pré-distribuição)**. 
+Especificamente: Na função responsável por normalizar as URLs do Mercado Livre (removendo parâmetros e focando no domínio + path do produto). A lógica de agrupamento (group by) deve rodar logo após a extração das métricas de preço e desconto, garantindo que o array final gerado para o "executor de posts" já esteja limpo.
+
+### 3. Impactos
+- **Experiência do Usuário:** Postagens 40 e 41 foram a mesma cadeira seguidas. Isso gera cansaço visual, percepção de spam e perda de credibilidade no grupo.
+- **Ocupação de Slots:** O limite diário é de 104 posts. O roteiro usou 2 vagas preciosas para o mesmo item físico, reduzindo o potencial de receita/diversidade do dia.
+- **Histórico Anti-Repetição de Amanhã:** O histórico salvará dois registros distintos para o mesmo produto (URLs de afiliado diferentes). Amanhã, se o ML listar o item novamente com um terceiro link de afiliado, o script anti-repetição pode falhar em detectar a similaridade ou ficar poluído com chaves redundantes.
+
+### 4. Proposta de Correção Exata (Lógica de Dedup por Slug)
+Implementar a função `deduplicate_by_mercadolivre_slug()`:
+
+1. **Extração:** Para cada item do roteiro, extrair o `domain + path` da URL limpa do ML, ignorando o `https://meli.la/...`.
+2. **Agrupamento:** Criar um dicionário onde a chave é o SLUG extraído.
+3. **Heurística de Seleção (Regra de Negócio estabelecida):** Ao colidir dois índices no mesmo slug, manter o produto de MAIOR DESCONTO (`desconto`). 
+4. **Tie-breaker (Desempate):** Se o desconto for igual (como no Ventilador, ambos com 29%), manter o de MENOR PREÇO (idx 47: 105.05, descartar idx 46: 112). No caso da cadeira, manter idx 96 (49% de descarte), descartar idx 98 (46%).
+5. **Saída:** Remover os perdedores do array final do roteiro diário.
+
+### 5. Outros Riscos de Duplicação
+Analisando os logs do sistema, identifico um risco duplicatório secundário e altamente destrutivo: **A instabilidade da Bridge do WhatsApp**.
+- Houveram 9 reconexões da bridge em 2 horas. 
+- Se o executor enviar um post e a conexão cair exatamente durante o retorno do *ACK* (Confirmação de Recebimento), o executor pode marcar o post como "Falhou".
+- Ao reconectar, o executor tentará reenviar o post, causando uma duplicata **na entrega ao usuário** e não no roteiro. 
+- **Recomenda
