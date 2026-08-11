@@ -164,6 +164,32 @@ def gerar_links_meli_batch(ofertas):
             print(f"  ⚠️ Só {len(links)} links gerados de {len(ofertas)}")
         return links
 
+async def bridge_estavel(min_estavel_seg=60):
+    """
+    Verifica se a bridge está estável (sem reconexões nos últimos N segundos).
+    Retorna True se estável. Evita envio durante reconexão (causa de duplicação:
+    o Baileys reenvia mensagens pendentes após reconectar → WhatsApp entrega 2x).
+    """
+    import subprocess as _sp
+    try:
+        r = _sp.run(["tail", "-200", os.path.expanduser("~/.hermes/whatsapp/bridge.log")],
+                    capture_output=True, text=True, timeout=10)
+        log = r.stdout
+        if "Connection closed" not in log:
+            return True
+        # Achar o timestamp da última reconexão no log
+        import re as _re
+        # Log tem timestamps? Se não, contar ocorrências recentes (últimas 200 linhas)
+        quedas = log.count("Connection closed")
+        # Bridge loga em tempo real — 200 linhas ≈ últimos minutos
+        # Se mais de 2 quedas nas últimas 200 linhas, provavelmente instável
+        if quedas > 2:
+            return False
+        return True
+    except Exception:
+        return True  # em dúvida, permite (melhor que travar o roteiro)
+
+
 async def enviar(chat, file_path, caption):
     """Envia card+caption ou só texto via bridge."""
     import urllib.request
@@ -203,6 +229,12 @@ async def agendar_envios(posts, dry_run=False, forcar=None, revisar_apos=None):
             tipo = "TEXTO" if post["card"] is None else "CARD+TEXTO"
             print(f"  🧪 [DRY] Post {post['num']} {post['horario']} [{tipo}]: {post['texto'][:70]}...")
         else:
+            # Esperar a bridge ESTABILIZAR antes de enviar (evita duplicação por reenvio pós-reconexão)
+            for _tentativa in range(18):  # até 3 min
+                if await bridge_estavel():
+                    break
+                print(f"  ⏸️ Bridge instável (reconexão recente) — aguardando estabilizar ({_tentativa+1}/18)...")
+                await asyncio.sleep(10)
             status, resp = await enviar(GRUPO, post["card"], post["texto"])
             ok = "✅" if status == 200 else "❌"
             print(f"  {ok} Post {post['num']} ({post['horario']}): HTTP {status} {resp[:60]}")
