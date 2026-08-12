@@ -53,7 +53,11 @@ def gerar_cards_batch(ofertas):
 
     cards = []
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=True, args=[
+            "--disable-blink-features=AutomationControlled",
+            "--disable-dev-shm-usage", "--no-sandbox",
+            "--js-flags=--max-old-space-size=256",
+        ])
         page = browser.new_page(viewport={"width": 1080, "height": 1080})
         for i, oferta in enumerate(ofertas):
             try:
@@ -110,7 +114,9 @@ def gerar_links_meli_batch(ofertas):
         ctx = p.chromium.launch_persistent_context(
             USER_DATA_DIR, headless=True, viewport={"width": 1280, "height": 900},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-            locale="pt-BR", args=["--disable-blink-features=AutomationControlled"])
+            locale="pt-BR", args=["--disable-blink-features=AutomationControlled",
+                                  "--disable-dev-shm-usage", "--no-sandbox",
+                                  "--js-flags=--max-old-space-size=256"])
         page = ctx.new_page()
         # INJETAR COOKIES DO PORTAL (sessão salva via Cookie-Editor — expira ~30 dias)
         cookies = carregar_cookies_portal()
