@@ -12,16 +12,30 @@ Horários fixos conforme cronograma do Renato (25 ciclos, intervalos 10→31min)
 import json, os, sys, time, hashlib
 
 # ── Cronograma de teste: 140 ofertas, 08:00→23:00 ─────────────────────
-# Abertura às 08:00, 140 ofertas distribuídas uniformemente e encerramento às 23:00.
-# Intervalo médio entre mensagens: ~6,4 min (janela de 15 horas).
+# 35 ciclos de 4 ofertas: 5 min entre ofertas do mesmo ciclo e pausas
+# maiores de 10/11 min entre ciclos. Abertura e encerramento incluídos.
 def _gerar_horarios(n_ofertas=140):
     from datetime import datetime, timedelta
     inicio = datetime.strptime("08:00", "%H:%M")
     fim = datetime.strptime("23:00", "%H:%M")
-    total_mensagens = n_ofertas + 2  # abertura + ofertas + encerramento
-    passo = (fim - inicio).total_seconds() / (total_mensagens - 1)
-    return [(inicio + timedelta(seconds=round(i * passo))).strftime("%H:%M")
-            for i in range(total_mensagens)]
+    ciclo = 4
+    ciclos = (n_ofertas + ciclo - 1) // ciclo
+    horarios = [inicio]
+    atual = inicio
+    enviados = 0
+    for c in range(ciclos):
+        quantidade = min(ciclo, n_ofertas - enviados)
+        for j in range(quantidade):
+            atual += timedelta(minutes=5)
+            horarios.append(atual)
+        enviados += quantidade
+        if enviados < n_ofertas:
+            # 25 pausas de 11 min e 9 de 10 min: fecha exatamente às 23h.
+            pausa = 11 if c < 25 else 10
+            atual += timedelta(minutes=pausa)
+    # Cinco minutos entre a última oferta e o encerramento.
+    horarios.append(fim)
+    return [h.strftime("%H:%M") for h in horarios]
 
 HORARIOS = _gerar_horarios(140)
 
