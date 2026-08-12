@@ -11,61 +11,19 @@ Horários fixos conforme cronograma do Renato (25 ciclos, intervalos 10→31min)
 """
 import json, os, sys, time, hashlib
 
-# ── Horários exatos (104 posts) — pausas 10→17min, reinicia em 10 ──────
-HORARIOS = [
-    # Ciclo 1
-    "08:00", "08:05", "08:10", "08:15",
-    # Ciclo 2
-    "08:30", "08:35", "08:40", "08:45",
-    # Ciclo 3
-    "09:01", "09:06", "09:11", "09:16",
-    # Ciclo 4
-    "09:33", "09:38", "09:43", "09:48",
-    # Ciclo 5
-    "10:06", "10:11", "10:16", "10:21",
-    # Ciclo 6
-    "10:40", "10:45", "10:50", "10:55",
-    # Ciclo 7
-    "11:15", "11:20", "11:25", "11:30",
-    # Ciclo 8
-    "11:51", "11:56", "12:01", "12:06",
-    # Ciclo 9
-    "12:28", "12:33", "12:38", "12:43",
-    # Ciclo 10
-    "12:58", "13:03", "13:08", "13:13",
-    # Ciclo 11
-    "13:29", "13:34", "13:39", "13:44",
-    # Ciclo 12
-    "14:01", "14:06", "14:11", "14:16",
-    # Ciclo 13
-    "14:34", "14:39", "14:44", "14:49",
-    # Ciclo 14
-    "15:08", "15:13", "15:18", "15:23",
-    # Ciclo 15
-    "15:43", "15:48", "15:53", "15:58",
-    # Ciclo 16
-    "16:19", "16:24", "16:29", "16:34",
-    # Ciclo 17
-    "16:56", "17:01", "17:06", "17:11",
-    # Ciclo 18
-    "17:26", "17:31", "17:36", "17:41",
-    # Ciclo 19
-    "17:57", "18:02", "18:07", "18:12",
-    # Ciclo 20
-    "18:29", "18:34", "18:39", "18:44",
-    # Ciclo 21
-    "19:02", "19:07", "19:12", "19:17",
-    # Ciclo 22
-    "19:36", "19:41", "19:46", "19:51",
-    # Ciclo 23
-    "20:11", "20:16", "20:21", "20:26",
-    # Ciclo 24
-    "20:47", "20:52", "20:57", "21:02",
-    # Ciclo 25
-    "21:24", "21:29", "21:34", "21:39",
-    # Ciclo 26 (extras 5 em 5 + boa noite)
-    "21:44", "21:49", "21:54", "22:00",
-]
+# ── Cronograma de teste: 140 ofertas, 08:00→23:00 ─────────────────────
+# Abertura às 08:00, 140 ofertas distribuídas uniformemente e encerramento às 23:00.
+# Intervalo médio entre mensagens: ~6,4 min (janela de 15 horas).
+def _gerar_horarios(n_ofertas=140):
+    from datetime import datetime, timedelta
+    inicio = datetime.strptime("08:00", "%H:%M")
+    fim = datetime.strptime("23:00", "%H:%M")
+    total_mensagens = n_ofertas + 2  # abertura + ofertas + encerramento
+    passo = (fim - inicio).total_seconds() / (total_mensagens - 1)
+    return [(inicio + timedelta(seconds=round(i * passo))).strftime("%H:%M")
+            for i in range(total_mensagens)]
+
+HORARIOS = _gerar_horarios(140)
 
 # ── Aberturas (Post 1) — sempre diferentes ──────────────────────────────
 ABERTURAS = [
@@ -213,7 +171,7 @@ def resumir_titulo(titulo, max_len=48):
         t = t[:max_len].rsplit(" ", 1)[0] + "…"
     return t
 
-def distribuir_ofertas(ofertas, n=102):
+def distribuir_ofertas(ofertas, n=140):
     """
     Distribui as ofertas de forma EQUILIBRADA ao longo do dia:
     - Cada ciclo (4 posts) mistura faixas: impulso, médio, oportunidade e alto ticket
@@ -318,7 +276,7 @@ def distribuir_ofertas(ofertas, n=102):
     return ordem[:n]
 
 def construir_roteiro(ofertas, data, dia_idx=0, cards=None, links=None, chamadas=None):
-    """Monta o roteiro completo de 104 posts com ofertas reais distribuídas."""
+    """Monta o roteiro completo de 142 mensagens: abertura + 140 ofertas + encerramento."""
     chamadas_pool = chamadas if chamadas else gerar_chamadas()
     posts = []
 
@@ -326,12 +284,12 @@ def construir_roteiro(ofertas, data, dia_idx=0, cards=None, links=None, chamadas
     abertura = ABERTURAS[dia_idx % len(ABERTURAS)]
     posts.append({"num": 1, "horario": HORARIOS[0], "tipo": "abertura", "texto": abertura, "card": None})
 
-    # Posts 2-103 — ofertas reais (102 produtos, distribuídos de forma equilibrada)
-    ordem = distribuir_ofertas(ofertas, n=102)
+    # Posts 2-141 — 140 ofertas reais, distribuídas de forma equilibrada
+    ordem = distribuir_ofertas(ofertas, n=140)
     # MAPA: link original da oferta → índice no array (para casar card/link corretos)
     indice_por_link = {o.get("link", ""): i for i, o in enumerate(ofertas)}
     n_ofertas = len(ordem)
-    for i in range(102):
+    for i in range(140):
         oferta = ordem[i % n_ofertas]
         # Índice ORIGINAL da oferta (a distribuição reordena! card/link/chamada precisam do índice original)
         idx_orig = indice_por_link.get(oferta.get("link", ""), i % len(ofertas))
@@ -388,9 +346,9 @@ def construir_roteiro(ofertas, data, dia_idx=0, cards=None, links=None, chamadas
             card_path = cards[idx_orig]
         posts.append({"num": i+2, "horario": HORARIOS[i+1], "tipo": "oferta", "texto": texto, "card": card_path})
 
-    # Post 104 — Encerramento (22:00)
+    # Post 142 — Encerramento (23:00)
     encerramento = ENCERRAMENTOS[dia_idx % len(ENCERRAMENTOS)]
-    posts.append({"num": 104, "horario": HORARIOS[103], "tipo": "encerramento", "texto": encerramento, "card": None})
+    posts.append({"num": 142, "horario": HORARIOS[141], "tipo": "encerramento", "texto": encerramento, "card": None})
 
     return posts
 

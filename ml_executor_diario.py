@@ -387,7 +387,7 @@ def main():
         # Aplicar MÉTRICA de preço + anti-repetição (definida 08/08)
         hist = carregar_historico()
         ja_postados = set(hist.get("links", {}).keys())
-        ofertas = filtrar_por_metrica(ofertas, n_desejado=102, ja_postados=ja_postados)
+        ofertas = filtrar_por_metrica(ofertas, n_desejado=140, ja_postados=ja_postados)
         # DEDUP dupla camada (GLM-5.2 10/08): slug (mesmo item) + título (variações do mesmo produto)
         n_antes = len(ofertas)
         ofertas = deduplicar_por_slug(ofertas)
@@ -411,14 +411,14 @@ def main():
         with open(json_path, "w") as f:
             json.dump({"data": hoje, "ofertas": ofertas, "cards": [], "links": []}, f, ensure_ascii=False, indent=1)
 
-    if len(ofertas) < 102:
-        print(f"⚠️ Só {len(ofertas)} ofertas — roteiro usará repetição")
+    if len(ofertas) < 140:
+        print(f"⚠️ Só {len(ofertas)} ofertas — roteiro poderá usar repetição")
 
     # Fase 2: cards (se não existirem)
     with open(json_path) as f:
         dados = json.load(f)
     cards = dados.get("cards") or []
-    if len(cards) < 102 and not args.so_links and not args.so_enviar:
+    if len(cards) < 140 and not args.so_links and not args.so_enviar:
         print("🖼️ Gerando cards...")
         cards = gerar_cards_batch(ofertas)
         dados["cards"] = cards
@@ -427,12 +427,12 @@ def main():
 
     # Fase 3: links meli.la (se não existirem)
     links = dados.get("links") or []
-    if len(links) < 102 and not args.so_enviar:
+    if len(links) < 140 and not args.so_enviar:
         print("🔗 Gerando links meli.la...")
         links = gerar_links_meli_batch(ofertas)
         # FALLBACK ANTI-INTERRUPÇÃO: se o portal falhar (sessão expirada/captcha),
         # usar link direto com tag de afiliado (formato oficial, rastreia igual)
-        if len(links) < 102:
+        if len(links) < 140:
             print(f"⚠️ Só {len(links)} meli.la gerados — completando com links diretos com tag...")
             for i, o in enumerate(ofertas):
                 if i < len(links) and links[i]:
