@@ -30,8 +30,10 @@ def _gerar_horarios(n_ofertas=140):
             horarios.append(atual)
         enviados += quantidade
         if enviados < n_ofertas:
-            # 25 pausas de 11 min e 9 de 10 min: fecha exatamente às 23h.
-            pausa = 11 if c < 25 else 10
+            # Com 140 ofertas e 5 min entre cada uma, restam 195 min
+            # para as 34 pausas de ciclo: 25 pausas de 6 min + 9 de 5 min.
+            # Pausas de 10-12 min não cabem mantendo 08:00-23:00.
+            pausa = 6 if c < 25 else 5
             atual += timedelta(minutes=pausa)
     # Cinco minutos entre a última oferta e o encerramento.
     horarios.append(fim)
