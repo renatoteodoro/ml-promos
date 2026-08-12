@@ -396,7 +396,7 @@ def main():
             print(f"   🧹 Dedup: {n_antes - len(ofertas)} duplicatas do mesmo produto removidas")
         print(f"✅ {len(ofertas)} ofertas selecionadas pela métrica")
         resumo = resumo_metrica(ofertas)
-        print(f"   📊 Distribuição: até R$200={resumo['core_50_200']} | R$200-500={resumo['medio_200_500']} | R$500-1000={resumo['oportunidade_500_1000']} | >R$1000={resumo['acima_1000']} | média R$ {resumo['preco_medio']}")
+        print(f"   📊 Distribuição: até R$200={resumo['core_50_200']} | R$200-500={resumo['medio_200_500']} | R$500-1000={resumo['oportunidade_500_1000']} | R$1000-7000={resumo['alto_1000_7000']} | >R$7000={resumo['acima_7000']} | média R$ {resumo['preco_medio']}")
         # Comparação de preços: buscar MENOR preço do catálogo (vários vendedores)
         print("🔎 Comparando preços entre vendedores do mesmo produto (catálogo)...")
         ofertas = enriquecer_lote(ofertas)
@@ -453,6 +453,20 @@ def main():
             json.dump(dados, f, ensure_ascii=False, indent=1)
         n_meli = sum(1 for l in links if l and "meli.la" in l)
         print(f"   ✅ {len(links)} links prontos ({n_meli} meli.la + {len(links)-n_meli} diretos com tag)")
+
+    # FASE 3.5: VALIDAR links x ofertas (og:title) — incidente 11/08 (links deslocados +1)
+    # O gerador pode associar meli.la ao produto errado (DOM da página); corrige antes de postar.
+    if not args.so_enviar and not args.dry_run:
+        try:
+            from ml_validar_links import validar_links
+            _ok, _corr, _sem = validar_links(json_path)
+            if _corr:
+                print(f"🔎 {_corr} links corrigidos para link direto com tag (validados por og:title)")
+            with open(json_path) as f:
+                dados = json.load(f)
+            links = dados.get("links") or []
+        except Exception as e:
+            print(f"⚠️ Validação de links falhou: {str(e)[:80]} (seguindo com links atuais)")
 
     # Vincular links às ofertas
     for i, o in enumerate(ofertas):
