@@ -105,8 +105,18 @@ def carregar_cookies_portal():
     return pw
 
 def gerar_links_meli_batch(ofertas):
-    """Gera links meli.la para TODAS as ofertas de uma vez (batch no Gerador de Links)."""
-    import re as _re
+    """
+    Gera links meli.la via API OFICIAL do portal (descoberta 13/08/2026).
+
+    A interface nova (linkbuilder) chama:
+      POST https://www.mercadolivre.com.br/affiliate-program/api/v2/affiliates/createLink
+      Body: {"urls": [...], "tag": "renatoteodoro"}
+    Retorna JSON com short_url (meli.la) por URL.
+
+    Sessão: usa o perfil persistente do Chromium (chromium-data) — o navegador
+    mantém a sessão de afiliado viva. NÃO injetar cookies do Cookie-Editor:
+    cookies expirados SOBRESCREVEM a sessão boa do perfil e quebram o login.
+    """
     USER_DATA_DIR = os.path.expanduser("~/.hermes/ml-affiliate/chromium-data")
     from playwright.sync_api import sync_playwright
 
@@ -118,89 +128,76 @@ def gerar_links_meli_batch(ofertas):
                                   "--disable-dev-shm-usage", "--no-sandbox",
                                   "--js-flags=--max-old-space-size=256"])
         page = ctx.new_page()
-        # INJETAR COOKIES DO PORTAL (sessão salva via Cookie-Editor — expira ~30 dias)
-        cookies = carregar_cookies_portal()
-        if cookies:
-            page.goto("https://www.mercadolivre.com.br", timeout=30000, wait_until="domcontentloaded")
-            ctx.add_cookies(cookies)
-            print(f"  🔐 {len(cookies)} cookies do portal injetados")
-        page.goto("https://www.mercadolivre.com.br/afiliados/hub?is_affiliate=true", timeout=45000, wait_until="domcontentloaded")
+        page.goto("https://www.mercadolivre.com.br/afiliados/linkbuilder", timeout=45000, wait_until="domcontentloaded")
         page.wait_for_timeout(10000)
 
-        el = page.query_selector("text=Gerador de links")
-        if el:
-            el.click(force=True)
-            page.wait_for_timeout(8000)
-
-        ta = page.query_selector("textarea:visible")
-        if not ta:
-            # Detectar bloqueio do portal (mensagem de erro/captcha em vez de gerador)
-            body_text = page.locator("body").inner_text()[:2000]
-            if "Hubo un error" in body_text or "accediendo a esta pagina" in body_text:
-                print("  ❌ PORTAL BLOQUEADO: 'Hubo un error accediendo a esta pagina' — sessão expirada/captcha.")
-                print("  ⚠️ RENOVE OS COOKIES em ~/.hermes/ml-affiliate/cookies_portal.json e rode de novo.")
-            elif "captcha" in body_text.lower() or "verificaci" in body_text.lower():
-                print("  ❌ CAPTCHA DETECTADO no portal — não é problema de lote, é bloqueio anti-bot.")
-                print("  ⚠️ RENOVE A SESSÃO pelo navegador manual e re-exporte os cookies.")
-            else:
-                print(f"  ❌ Textarea do gerador não encontrado. Página mostra: {body_text[:150]}")
+        # Verificar sessão: se redirecionou para login, a sessão do perfil caiu
+        if "login" in page.url:
+            print("  ❌ SESSÃO EXPIRADA: o portal redirecionou para login.")
+            print("  ⚠️ Abra o linkbuilder no navegador do PC e faça login (a sessão salva no perfil).")
             ctx.close()
             return [None]*len(ofertas)
 
-        # ── SANITY CHECK: gerar 1 link primeiro para confirmar sessão viva ──
-        print("  🧪 Sanity check: gerando 1 link de teste...")
-        ta.fill(ofertas[0]["link"])
-        page.wait_for_timeout(1500)
-        btn0 = page.query_selector("button:has-text('Gerar')")
-        if btn0:
-            btn0.click(force=True)
-            page.wait_for_timeout(15000)
-        teste_vals = page.eval_on_selector_all("input, textarea", "els => els.map(e => e.value || e.textContent).filter(v => v && v.includes('meli.la'))")
-        teste_texts = page.eval_on_selector_all("body *", "els => els.filter(e => e.children.length === 0).map(e => e.textContent).filter(t => t && t.includes('meli.la'))")
-        teste_hrefs = page.eval_on_selector_all("a", "els => els.map(e => e.href).filter(h => h && h.includes('meli.la'))")
-        teste_todos = teste_vals + teste_texts + teste_hrefs
-        teste_links = set()
-        for v in teste_todos:
-            for m in _re.findall(r'https?://meli\.la/\w+', v):
-                teste_links.add(m)
-        if not teste_links:
-            body_text = page.locator("body").inner_text()[:1500]
-            print(f"  ❌ SANITY CHECK FALHOU: nenhum meli.la gerado no teste. Página: {body_text[:150]}")
-            print("  ⚠️ Sessão do portal inválida — RENOVE OS COOKIES antes do próximo lote.")
+        links = [None]*len(ofertas)
+        # ── SANITY CHECK: 1 URL primeiro para confirmar sessão viva ──
+        # O que valida a sessão é a API RESPONDER (HTTP 200). O erro "URL not allowed"
+        # (error_code 111) significa produto não autorizado — NÃO sessão morta.
+        print("  🧪 Sanity check: testando sessão via API...")
+        try:
+            teste = page.evaluate("""async (urls) => {
+                const r = await fetch('/affiliate-program/api/v2/affiliates/createLink', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({urls: urls, tag: 'renatoteodoro'})
+                });
+                return {status: r.status, data: await r.json()};
+            }""", [ofertas[0]["link"]])
+        except Exception as e:
+            print(f"  ❌ SANITY CHECK FALHOU (fetch): {str(e)[:80]}")
             ctx.close()
             return [None]*len(ofertas)
-        print(f"  ✅ Sanity check OK: {list(teste_links)[0]} — sessão viva, seguindo com o lote...")
+        if teste.get("status") != 200:
+            print(f"  ❌ SANITY CHECK FALHOU: HTTP {teste.get('status')} — sessão inválida (redirecionou p/ login?).")
+            ctx.close()
+            return [None]*len(ofertas)
+        print("  ✅ Sanity check OK: API respondeu HTTP 200 — sessão viva, seguindo com o lote...")
 
-        # Colar TODAS as URLs de uma vez (separadas por linha)
-        urls = "\n".join(o["link"] for o in ofertas)
-        ta.fill(urls)
-        page.wait_for_timeout(2000)
-        btn = page.query_selector("button:has-text('Gerar')")
-        if btn:
-            btn.click(force=True)
-            print(f"  🔗 Gerando {len(ofertas)} links...")
-            # Geração em batch — aguardar até 4 min
-            for _ in range(8):
-                page.wait_for_timeout(30000)
-                vals = page.eval_on_selector_all("input, textarea", "els => els.map(e => e.value || e.textContent).filter(v => v && v.includes('meli.la'))")
-                texts_all = page.eval_on_selector_all("body *", "els => els.filter(e => e.children.length === 0).map(e => e.textContent).filter(t => t && t.includes('meli.la'))")
-                hrefs = page.eval_on_selector_all("a", "els => els.map(e => e.href).filter(h => h && h.includes('meli.la'))")
-                todos = vals + texts_all + hrefs
-                links = []
-                vistos = set()
-                for v in todos:
-                    for m in _re.findall(r'https?://meli\.la/\w+', v):
-                        if m not in vistos:
-                            vistos.add(m)
-                            links.append(m)
-                print(f"    ...{len(links)}/{len(ofertas)} links")
-                if len(links) >= len(ofertas):
-                    break
+        # ── LOTE: chamar a API com TODAS as URLs (em blocos de 10) ──
+        # Bloco de 40 falhava silenciosamente (testado 13/08); 10 funciona 100%.
+        print(f"  🔗 Gerando {len(ofertas)} links via API oficial...")
+        TAM = 10
+        for inicio in range(0, len(ofertas), TAM):
+            fatia = ofertas[inicio:inicio+TAM]
+            urls_bloco = [o["link"] for o in fatia]
+            try:
+                resp = page.evaluate("""async (urls) => {
+                    const r = await fetch('/affiliate-program/api/v2/affiliates/createLink', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({urls: urls, tag: 'renatoteodoro'})
+                    });
+                    return {status: r.status, data: await r.json()};
+                }""", urls_bloco)
+            except Exception as e:
+                print(f"  ⚠️ bloco {inicio//TAM+1} falhou: {str(e)[:80]}")
+                continue
+            if resp.get("status") != 200:
+                print(f"  ⚠️ bloco {inicio//TAM+1}: HTTP {resp.get('status')} — pulando")
+                continue
+            for i, item in enumerate(resp.get("data", {}).get("urls", [])):
+                if item.get("created") and item.get("short_url"):
+                    links[inicio + i] = item["short_url"]
+                else:
+                    # Produto não autorizado no programa (error_code 111) — cai no fallback
+                    pass
+            ok_bloco = sum(1 for i in range(inicio, min(inicio+TAM, len(links))) if links[i])
+            print(f"    ...{ok_bloco}/{len(fatia)} no bloco {inicio//TAM+1}")
+            page.wait_for_timeout(1500)
         ctx.close()
-        if 'links' not in dir():
-            return [None]*len(ofertas)
-        if len(links) < len(ofertas):
-            print(f"  ⚠️ Só {len(links)} links gerados de {len(ofertas)}")
+        n_ok = sum(1 for l in links if l)
+        print(f"  ✅ {n_ok}/{len(ofertas)} links meli.la gerados")
+        if n_ok < len(ofertas):
+            print(f"  ⚠️ {len(ofertas)-n_ok} produtos não autorizados no programa de afiliados — usarão link direto com tag")
         return links
 
 async def bridge_estavel(min_estavel_seg=60):
