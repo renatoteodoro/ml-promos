@@ -35,6 +35,53 @@ def save_state(state):
         json.dump(state, f, ensure_ascii=False, indent=1)
 
 
+def gerar_story_vertical(card_path):
+    """
+    Converte o card do feed (4:5 ou 1:1) para formato vertical 9:16 para Stories.
+    Recorte central + fundo que preenche as bordas (evita corte de texto).
+    Salva em ~/divulgacao/promo-galaxias/story_{timestamp}.png
+    """
+    try:
+        from PIL import Image, ImageFilter, ImageEnhance
+        LANCZOS = getattr(Image, "Resampling", Image).LANCZOS
+    except ImportError:
+        print("  ⚠️ Pillow não instalado — usando card original (IG corta para 9:16)")
+        return card_path
+
+    im = Image.open(card_path).convert("RGB")
+    w, h = im.size
+
+    # Meta 9:16 (1080x1920)
+    META_W, META_H = 1080, 1920
+
+    # Se já for vertical 9:16 (±10%), usar direto
+    if abs((w / h) - (9 / 16)) < 0.05:
+        return card_path
+
+    # Escalar para caber em 1080x1920 mantendo proporção
+    escala = min(META_W / w, META_H / h)
+    novo_w, novo_h = int(w * escala), int(h * escala)
+    im_red = im.resize((novo_w, novo_h), LANCZOS)
+
+    # Fundo: versão desfocada e escurecida preenchendo todo o canvas
+    fundo = im.resize((META_W, META_H), LANCZOS)
+    fundo = fundo.filter(ImageFilter.GaussianBlur(18))
+    fundo = ImageEnhance.Brightness(fundo).enhance(0.55)
+
+    # Centralizar a imagem nítida sobre o fundo
+    x = (META_W - novo_w) // 2
+    y = (META_H - novo_h) // 2
+    fundo.paste(im_red, (x, y))
+
+    # Salvar
+    out_dir = os.path.join(DIVULGACAO, "promo-galaxias")
+    os.makedirs(out_dir, exist_ok=True)
+    out = os.path.join(out_dir, f"story_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+    fundo.save(out, "PNG")
+    print(f"   📐 Story vertical 9:16 gerado: {os.path.basename(out)}")
+    return out
+
+
 def publicar_story(image_url):
     data = json.dumps({"image_url": image_url, "account": "promo"}).encode()
     req = urllib.request.Request(STORY_ENDPOINT, data=data,
@@ -87,8 +134,7 @@ def main():
         print(f"❌ Card não encontrado: {card}")
         return 1
 
-    # Stories: usar a imagem do card (vertical) — gerar versão 9:16 se precisar
-    # (o card do feed é 4:5 ou 1:1; story aceita qualquer proporção, com crop central)
+    # Stories: usar o card convertido para vertical 9:16 (texto preservado, fundo desfocado)
     print(f"📌 Story: {o['titulo'][:60]}")
     print(f"   Preço: R$ {o['preco']:.2f} | Card: {os.path.basename(card)}")
 
@@ -96,10 +142,13 @@ def main():
         print(f"\n🧪 [DRY RUN] Publicaria story com imagem: {card}")
         return 0
 
+    # Converter para 9:16
+    card_story = gerar_story_vertical(card)
+
     # Upload da imagem para URL pública (litterbox)
     import subprocess
     r = subprocess.run(["curl", "-s", "-m", "60", "-F", "reqtype=fileupload",
-                        "-F", "time=24h", "-F", f"fileToUpload=@{card}"],
+                        "-F", "time=24h", "-F", f"fileToUpload=@{card_story}"],
                        capture_output=True, text=True, check=False)
     public_url = r.stdout.strip()
     if not public_url.startswith("http"):
