@@ -402,7 +402,7 @@ def main():
             print(f"   🧹 Dedup: {n_antes - len(ofertas)} duplicatas do mesmo produto removidas")
         print(f"✅ {len(ofertas)} ofertas selecionadas pela métrica")
         resumo = resumo_metrica(ofertas)
-        print(f"   📊 Distribuição: até R$200={resumo['core_50_200']} | R$200-500={resumo['medio_200_500']} | R$500-1000={resumo['oportunidade_500_1000']} | R$1000-7000={resumo['alto_1000_7000']} | >R$7000={resumo['acima_7000']} | média R$ {resumo['preco_medio']}")
+        print(f"   📊 Distribuição: R$20-50={resumo['micro_20_50']} | R$50-100={resumo['core_50_100']} | R$100-200={resumo['corep_100_200']} | R$200-500={resumo['medio_200_500']} | R$500-1000={resumo['oportunidade_500_1000']} | R$1000-3000={resumo['alto_1000_3000']} | R$3000-7000={resumo['premium_3000_7000']} | média R$ {resumo['preco_medio']}")
         # Comparação de preços: buscar MENOR preço do catálogo (vários vendedores)
         print("🔎 Comparando preços entre vendedores do mesmo produto (catálogo)...")
         ofertas = enriquecer_lote(ofertas)

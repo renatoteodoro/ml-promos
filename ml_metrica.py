@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
-Métrica de seleção de ofertas do Promo das Galáxias (definida 08/08/2026):
+Métrica de seleção de ofertas do Promo das Galáxias (definida 08/08/2026,
+revisada 12/08/2026 com análise de conversão — distribuição 30/20/15/15/10/8/2):
 
-Prioridade de preço (impulso):
-- CORE:    R$ 50-200   → 60% dos posts (compra por impulso)
-# - MÉDIO:   R$ 200-500    → 20% dos posts (bom ticket)
-# - OPORT.:  R$ 500-1000   → 10% dos posts
-# - ALTO:    R$ 1000-7000  → 10% dos posts (ofertas de maior ticket)
-# - EVITAR:  acima de R$ 7000
+Prioridade de preço (baseada em densidade do catálogo + desconto + comissão):
+- MICRO:   R$ 20-50    → 2%  dos posts (catálogo escasso, comissão baixa)
+- CORE:    R$ 50-100   → 10% dos posts (impulso barato, entrada de funil)
+- CORE+:   R$ 100-200  → 20% dos posts (melhor desconto médio do catálogo)
+- MÉDIO:   R$ 200-500  → 30% dos posts (maior potencial: densidade x desconto)
+- OPORT.:  R$ 500-1000 → 15% dos posts (ticket médio-alto)
+- ALTO:    R$ 1000-3000→ 15% dos posts (comissão forte, bom volume de catálogo)
+- PREMIUM: R$ 3000-7000→ 8%  dos posts (ticket alto, menor volume)
+- EVITAR:  acima de R$ 7000
 
 Anti-repetição:
 - Histórico em ~/divulgacao/historico_ofertas.json (links já postados)
@@ -93,25 +97,31 @@ def filtrar_por_metrica(ofertas, n_desejado=98, ja_postados=None):
         dedup.append(o)
     candidatas = dedup
 
-    # Classificar por faixa
-    core = [o for o in candidatas if 50 <= o["preco"] <= 200]
-    medio = [o for o in candidatas if 200 < o["preco"] <= 500]
-    oport = [o for o in candidatas if 500 < o["preco"] <= 1000]
-    alto = [o for o in candidatas if 1000 < o["preco"] <= 7000]
+    # Classificar por faixa (7 faixas — revisão de conversão 12/08)
+    f_micro = [o for o in candidatas if 20 <= o["preco"] <= 50]
+    f_core = [o for o in candidatas if 50 < o["preco"] <= 100]
+    f_corep = [o for o in candidatas if 100 < o["preco"] <= 200]
+    f_medio = [o for o in candidatas if 200 < o["preco"] <= 500]
+    f_oport = [o for o in candidatas if 500 < o["preco"] <= 1000]
+    f_alto = [o for o in candidatas if 1000 < o["preco"] <= 3000]
+    f_premium = [o for o in candidatas if 3000 < o["preco"] <= 7000]
 
     # Ordenar cada faixa por desconto (maior primeiro)
-    core.sort(key=lambda o: o.get("desconto") or 0, reverse=True)
-    medio.sort(key=lambda o: o.get("desconto") or 0, reverse=True)
-    oport.sort(key=lambda o: o.get("desconto") or 0, reverse=True)
-    alto.sort(key=lambda o: o.get("desconto") or 0, reverse=True)
+    for faixa in (f_micro, f_core, f_corep, f_medio, f_oport, f_alto, f_premium):
+        faixa.sort(key=lambda o: o.get("desconto") or 0, reverse=True)
 
-    # Montar proporção 60/20/10/10
-    n_core = int(n_desejado * 0.6)
-    n_medio = int(n_desejado * 0.2)
-    n_oport = int(n_desejado * 0.1)
-    n_alto = n_desejado - n_core - n_medio - n_oport
+    # Montar proporção 30/20/15/15/10/8/2 (soma = 100%)
+    n_medio = int(n_desejado * 0.30)
+    n_corep = int(n_desejado * 0.20)
+    n_oport = int(n_desejado * 0.15)
+    n_alto = int(n_desejado * 0.15)
+    n_core = int(n_desejado * 0.10)
+    n_premium = int(n_desejado * 0.08)
+    n_micro = n_desejado - (n_medio + n_corep + n_oport + n_alto + n_core + n_premium)
 
-    selecionadas = core[:n_core] + medio[:n_medio] + oport[:n_oport] + alto[:n_alto]
+    selecionadas = (f_micro[:n_micro] + f_core[:n_core] + f_corep[:n_corep]
+                    + f_medio[:n_medio] + f_oport[:n_oport]
+                    + f_alto[:n_alto] + f_premium[:n_premium])
 
     # Se faltar em alguma faixa, completar com a próxima
     faltam = n_desejado - len(selecionadas)
@@ -125,17 +135,23 @@ def filtrar_por_metrica(ofertas, n_desejado=98, ja_postados=None):
 def resumo_metrica(ofertas):
     """Resumo da distribuição para relatório."""
     n = len(ofertas)
-    core = sum(1 for o in ofertas if o["preco"] <= 200)
+    micro = sum(1 for o in ofertas if 20 <= o["preco"] <= 50)
+    core = sum(1 for o in ofertas if 50 < o["preco"] <= 100)
+    corep = sum(1 for o in ofertas if 100 < o["preco"] <= 200)
     medio = sum(1 for o in ofertas if 200 < o["preco"] <= 500)
     oport = sum(1 for o in ofertas if 500 < o["preco"] <= 1000)
-    alto = sum(1 for o in ofertas if 1000 < o["preco"] <= 7000)
+    alto = sum(1 for o in ofertas if 1000 < o["preco"] <= 3000)
+    premium = sum(1 for o in ofertas if 3000 < o["preco"] <= 7000)
     acima_limite = sum(1 for o in ofertas if o["preco"] > 7000)
     return {
         "total": n,
-        "core_50_200": core,
+        "micro_20_50": micro,
+        "core_50_100": core,
+        "corep_100_200": corep,
         "medio_200_500": medio,
         "oportunidade_500_1000": oport,
-        "alto_1000_7000": alto,
+        "alto_1000_3000": alto,
+        "premium_3000_7000": premium,
         "acima_7000": acima_limite,
         "preco_medio": round(sum(o["preco"] for o in ofertas) / n) if n else 0,
     }

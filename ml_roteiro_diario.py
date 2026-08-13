@@ -195,11 +195,16 @@ def distribuir_ofertas(ofertas, n=140):
     - Manhã: mais impulso; tarde/noite: mistura com melhores descontos
     Retorna lista de ofertas na ordem de postagem.
     """
-    # Classificar por faixa
-    core = sorted([o for o in ofertas if o["preco"] <= 200], key=lambda o: -(o.get("desconto") or 0))
-    medio = sorted([o for o in ofertas if 200 < o["preco"] <= 500], key=lambda o: -(o.get("desconto") or 0))
-    oport = sorted([o for o in ofertas if 500 < o["preco"] <= 1000], key=lambda o: -(o.get("desconto") or 0))
-    alto = sorted([o for o in ofertas if 1000 < o["preco"] <= 7000], key=lambda o: -(o.get("desconto") or 0))
+    # Classificar por faixa (7 faixas — revisão de conversão 12/08)
+    f_micro = sorted([o for o in ofertas if 20 <= o["preco"] <= 50], key=lambda o: -(o.get("desconto") or 0))
+    f_core = sorted([o for o in ofertas if 50 < o["preco"] <= 100], key=lambda o: -(o.get("desconto") or 0))
+    f_corep = sorted([o for o in ofertas if 100 < o["preco"] <= 200], key=lambda o: -(o.get("desconto") or 0))
+    f_medio = sorted([o for o in ofertas if 200 < o["preco"] <= 500], key=lambda o: -(o.get("desconto") or 0))
+    f_oport = sorted([o for o in ofertas if 500 < o["preco"] <= 1000], key=lambda o: -(o.get("desconto") or 0))
+    f_alto = sorted([o for o in ofertas if 1000 < o["preco"] <= 3000], key=lambda o: -(o.get("desconto") or 0))
+    f_premium = sorted([o for o in ofertas if 3000 < o["preco"] <= 7000], key=lambda o: -(o.get("desconto") or 0))
+    faixas = {"micro": f_micro, "core": f_core, "corep": f_corep, "medio": f_medio,
+              "oport": f_oport, "alto": f_alto, "premium": f_premium}
 
     # Fallback: se faltar em alguma faixa, completar com a seguinte
     def pegar_faixa(lista, idx):
@@ -208,26 +213,40 @@ def distribuir_ofertas(ofertas, n=140):
         return None
 
     ordem = []
-    ci = mi = oi = ai = 0
+    contadores = {k: 0 for k in faixas}
     ciclos = (n + 3) // 4
-    # Agenda de faixas proporcional à nova métrica 60/20/10/10.
-    # Gera a sequência por maior déficit relativo para distribuir alto ticket
+    # Agenda de faixas proporcional à métrica 30/20/15/15/10/8/2.
+    # Gera a sequência por maior déficit relativo para distribuir ticket alto
     # ao longo do dia, sem concentrá-lo no final.
     metas = {
-        "core": int(n * 0.6),
-        "medio": int(n * 0.2),
-        "oport": int(n * 0.1),
+        "medio": int(n * 0.30),
+        "corep": int(n * 0.20),
+        "oport": int(n * 0.15),
+        "alto": int(n * 0.15),
+        "core": int(n * 0.10),
+        "premium": int(n * 0.08),
     }
-    metas["alto"] = n - sum(metas.values())
+    metas["micro"] = n - sum(metas.values())
     usados = {k: 0 for k in metas}
     agenda_faixas = []
     for pos in range(n):
-        disponiveis = [k for k in metas if usados[k] < len({"core": core, "medio": medio, "oport": oport, "alto": alto}[k])]
+        disponiveis = [k for k in metas if usados[k] < len(faixas[k])]
         if not disponiveis:
             break
         tipo = max(disponiveis, key=lambda k: (metas[k] - usados[k]) / max(metas[k], 1))
         agenda_faixas.append(tipo)
         usados[tipo] += 1
+
+    # Ordem de fallback entre faixas (quando uma esgota, usa a mais próxima)
+    ORDEM_FALLBACK = {
+        "micro": ["micro", "core", "corep", "medio", "oport", "alto", "premium"],
+        "core": ["core", "corep", "medio", "micro", "oport", "alto", "premium"],
+        "corep": ["corep", "medio", "core", "oport", "alto", "micro", "premium"],
+        "medio": ["medio", "corep", "oport", "alto", "core", "premium", "micro"],
+        "oport": ["oport", "medio", "alto", "corep", "premium", "core", "micro"],
+        "alto": ["alto", "oport", "premium", "medio", "corep", "core", "micro"],
+        "premium": ["premium", "alto", "oport", "medio", "corep", "core", "micro"],
+    }
 
     for ciclo in range(ciclos):
         padrao = agenda_faixas[ciclo * 4:(ciclo + 1) * 4]
@@ -235,59 +254,26 @@ def distribuir_ofertas(ofertas, n=140):
         for tipo in padrao:
             if len(ordem) >= n:
                 break
-            if tipo == "core":
-                o = pegar_faixa(core, ci)
+            o = None
+            # Tenta a faixa principal, depois as alternativas na ordem
+            for tentativa in ORDEM_FALLBACK[tipo]:
+                o = pegar_faixa(faixas[tentativa], contadores[tentativa])
                 if o:
-                    ci += 1
-                else:
-                    o = pegar_faixa(medio, mi) or pegar_faixa(oport, oi)
-                    if o:
-                        mi += 1 if pegar_faixa(medio, mi) else 0
-                        oi += 1 if not pegar_faixa(medio, mi) else 0
-            elif tipo == "medio":
-                o = pegar_faixa(medio, mi)
-                if o:
-                    mi += 1
-                else:
-                    o = pegar_faixa(core, ci) or pegar_faixa(oport, oi)
-                    if o:
-                        ci += 1 if pegar_faixa(core, ci) else 0
-                        oi += 1 if not pegar_faixa(core, ci) else 0
-            elif tipo == "oport":
-                o = pegar_faixa(oport, oi)
-                if o:
-                    oi += 1
-                else:
-                    o = pegar_faixa(medio, mi) or pegar_faixa(alto, ai)
-                    if o:
-                        mi += 1 if pegar_faixa(medio, mi) else 0
-                        ai += 1 if not pegar_faixa(medio, mi) else 0
-            else:  # alto ticket
-                o = pegar_faixa(alto, ai)
-                if o:
-                    ai += 1
-                else:
-                    o = pegar_faixa(oport, oi) or pegar_faixa(medio, mi)
-                    if o:
-                        oi += 1 if pegar_faixa(oport, oi) else 0
-                        mi += 1 if not pegar_faixa(oport, oi) else 0
+                    contadores[tentativa] += 1
+                    break
             if o is not None:
                 ordem.append(o)
             else:
                 # Último recurso: qualquer oferta restante — MAS avançar o contador da
-                # faixa do item (11/08: sem isso, o item era re-pego pelo core depois,
-                # duplicando 13 produtos no roteiro — ex: Cortina posts 77/78).
+                # faixa do item (11/08: sem isso, o item era re-pego depois,
+                # duplicando produtos no roteiro).
                 resto = [x for x in ofertas if x not in ordem]
                 if resto:
                     o = resto[0]
-                    if o in core and core.index(o) >= ci:
-                        ci = core.index(o) + 1
-                    elif o in medio and medio.index(o) >= mi:
-                        mi = medio.index(o) + 1
-                    elif o in oport and oport.index(o) >= oi:
-                        oi = oport.index(o) + 1
-                    elif o in alto and alto.index(o) >= ai:
-                        ai = alto.index(o) + 1
+                    for k, lista in faixas.items():
+                        if o in lista:
+                            contadores[k] = max(contadores[k], lista.index(o) + 1)
+                            break
                     ordem.append(o)
     return ordem[:n]
 
