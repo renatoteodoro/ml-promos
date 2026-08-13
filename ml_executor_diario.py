@@ -134,9 +134,42 @@ def gerar_links_meli_batch(ofertas):
 
         ta = page.query_selector("textarea:visible")
         if not ta:
-            print("  ❌ Textarea do gerador não encontrado")
+            # Detectar bloqueio do portal (mensagem de erro/captcha em vez de gerador)
+            body_text = page.locator("body").inner_text()[:2000]
+            if "Hubo un error" in body_text or "accediendo a esta pagina" in body_text:
+                print("  ❌ PORTAL BLOQUEADO: 'Hubo un error accediendo a esta pagina' — sessão expirada/captcha.")
+                print("  ⚠️ RENOVE OS COOKIES em ~/.hermes/ml-affiliate/cookies_portal.json e rode de novo.")
+            elif "captcha" in body_text.lower() or "verificaci" in body_text.lower():
+                print("  ❌ CAPTCHA DETECTADO no portal — não é problema de lote, é bloqueio anti-bot.")
+                print("  ⚠️ RENOVE A SESSÃO pelo navegador manual e re-exporte os cookies.")
+            else:
+                print(f"  ❌ Textarea do gerador não encontrado. Página mostra: {body_text[:150]}")
             ctx.close()
             return [None]*len(ofertas)
+
+        # ── SANITY CHECK: gerar 1 link primeiro para confirmar sessão viva ──
+        print("  🧪 Sanity check: gerando 1 link de teste...")
+        ta.fill(ofertas[0]["link"])
+        page.wait_for_timeout(1500)
+        btn0 = page.query_selector("button:has-text('Gerar')")
+        if btn0:
+            btn0.click(force=True)
+            page.wait_for_timeout(15000)
+        teste_vals = page.eval_on_selector_all("input, textarea", "els => els.map(e => e.value || e.textContent).filter(v => v && v.includes('meli.la'))")
+        teste_texts = page.eval_on_selector_all("body *", "els => els.filter(e => e.children.length === 0).map(e => e.textContent).filter(t => t && t.includes('meli.la'))")
+        teste_hrefs = page.eval_on_selector_all("a", "els => els.map(e => e.href).filter(h => h && h.includes('meli.la'))")
+        teste_todos = teste_vals + teste_texts + teste_hrefs
+        teste_links = set()
+        for v in teste_todos:
+            for m in _re.findall(r'https?://meli\.la/\w+', v):
+                teste_links.add(m)
+        if not teste_links:
+            body_text = page.locator("body").inner_text()[:1500]
+            print(f"  ❌ SANITY CHECK FALHOU: nenhum meli.la gerado no teste. Página: {body_text[:150]}")
+            print("  ⚠️ Sessão do portal inválida — RENOVE OS COOKIES antes do próximo lote.")
+            ctx.close()
+            return [None]*len(ofertas)
+        print(f"  ✅ Sanity check OK: {list(teste_links)[0]} — sessão viva, seguindo com o lote...")
 
         # Colar TODAS as URLs de uma vez (separadas por linha)
         urls = "\n".join(o["link"] for o in ofertas)
