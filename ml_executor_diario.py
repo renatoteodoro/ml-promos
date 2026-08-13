@@ -437,7 +437,7 @@ def main():
         print("🔎 Comparando preços entre vendedores do mesmo produto (catálogo)...")
         ofertas = enriquecer_lote(ofertas)
         resumo2 = resumo_metrica(ofertas)
-        print(f"   📊 Após comparação: média R$ {resumo2['preco_medio']} | até R$200={resumo2['core_50_200']}")
+        print(f"   📊 Após comparação: média R$ {resumo2['preco_medio']} | R$20-50={resumo2['micro_20_50']} | R$50-100={resumo2['core_50_100']} | R$100-200={resumo2['corep_100_200']} | R$200-500={resumo2['medio_200_500']}")
         # Detectar cupons ativos nos produtos (ex: "X% OFF com Cupom")
         print("🎟️ Verificando cupons ativos nos produtos...")
         try:
