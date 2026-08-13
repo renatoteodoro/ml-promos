@@ -443,10 +443,11 @@ def main():
             for i, o in enumerate(ofertas):
                 if i < len(links) and links[i]:
                     continue
-                # Extrair MLB id do link original (aceita /p/MLB e formato de anúncio -MLB-)
-                m = re.search(r"/p/(MLB\d+)", o.get("link", "")) or re.search(r"-?(MLB\d{7,})-?", o.get("link", ""))
+                # Extrair MLB id do link original (aceita /p/MLB e formato de anúncio MLB-XXXXXXXXX-)
+                m = re.search(r"/p/(MLB\d+)", o.get("link", "")) or re.search(r"(MLB-\d{7,})", o.get("link", "")) or re.search(r"(MLB\d{7,})", o.get("link", ""))
                 if m:
-                    link_tag = f"https://www.mercadolivre.com.br/p/{m.group(1)}?matt_word=renatoteodoro&matt_tool=94885465"
+                    mlb_id = m.group(1).replace("-", "")
+                    link_tag = f"https://www.mercadolivre.com.br/p/{mlb_id}?matt_word=renatoteodoro&matt_tool=94885465"
                     while len(links) <= i:
                         links.append(None)
                     links[i] = link_tag
