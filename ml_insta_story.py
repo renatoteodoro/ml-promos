@@ -148,7 +148,8 @@ def main():
     # Upload da imagem para URL pública (litterbox)
     import subprocess
     r = subprocess.run(["curl", "-s", "-m", "60", "-F", "reqtype=fileupload",
-                        "-F", "time=24h", "-F", f"fileToUpload=@{card_story}"],
+                        "-F", "time=24h", "-F", f"fileToUpload=@{card_story}",
+                        "https://litterbox.catbox.moe/resources/internals/api.php"],
                        capture_output=True, text=True, check=False)
     public_url = r.stdout.strip()
     if not public_url.startswith("http"):
