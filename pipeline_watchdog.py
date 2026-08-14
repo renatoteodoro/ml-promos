@@ -69,6 +69,59 @@ def ultimo_post_hoje():
         return None
 
 
+def ultimo_horario_roteiro(roteiro_path):
+    """Último horário programado no roteiro do dia (ex: 23:00). None se inválido."""
+    try:
+        with open(roteiro_path) as f:
+            d = json.load(f)
+        # Horários vêm do gerador de horários (pode estar em 'posts', 'horarios' ou ofertas com horario)
+        horarios = []
+        if isinstance(d, dict):
+            for chave in ("posts", "horarios", "ofertas"):
+                itens = d.get(chave)
+                if isinstance(itens, list):
+                    for it in itens:
+                        h = None
+                        if isinstance(it, dict):
+                            h = it.get("horario") or it.get("hora") or it.get("time")
+                        elif isinstance(it, str):
+                            h = it
+                        if h and isinstance(h, str) and ":" in h:
+                            horarios.append(h)
+        if not horarios:
+            return None
+        horarios.sort()
+        return horarios[-1]
+    except Exception:
+        return None
+
+
+def dia_completo(roteiro_path, log_exec):
+    """True se o dia terminou normalmente. Detecta pelo marcador '🏁 Concluído'
+    no log do executor (impresso quando ele processa todo o roteiro) OU pelo
+    último horário do roteiro já enviado com HTTP 200."""
+    # Marcador principal: executor terminou o dia ("Concluído: N posts processados")
+    try:
+        if os.path.exists(log_exec):
+            r = subprocess.run(["grep", "Concluído", log_exec], capture_output=True, text=True, timeout=10)
+            if r.stdout.strip():
+                return True
+    except Exception:
+        pass
+    # Fallback: último horário do roteiro enviado com HTTP 200
+    ult_hor = ultimo_horario_roteiro(roteiro_path)
+    if not ult_hor:
+        return False
+    try:
+        r = subprocess.run(["grep", "HTTP 200", log_exec], capture_output=True, text=True, timeout=10)
+        for linha in r.stdout.split("\n"):
+            if f"({ult_hor})" in linha and "HTTP 200" in linha:
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def main():
     agora = datetime.now()
     hhmm = agora.strftime("%H:%M")
@@ -80,6 +133,12 @@ def main():
         return 0
 
     roteiro = os.path.join(DIVULGACAO, f"roteiro_{hoje}.json")
+    log_exec = f"/tmp/ml_exec_{hoje}.log"
+
+    # CASO 0: Dia já completou (último post do roteiro enviado) → SILENCIOSO, não relança
+    if dia_completo(roteiro, log_exec):
+        log(f"dia completo ({ultimo_horario_roteiro(roteiro)}) — sem ação")
+        return 0
 
     # CASO 1: Roteiro não existe e já passou 07:45 → alerta (precisa ação)
     if not os.path.exists(roteiro) and hhmm >= "07:45":
