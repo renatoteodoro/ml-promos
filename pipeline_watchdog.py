@@ -164,8 +164,10 @@ def main():
         return 0
 
     # CASO 0.5: Roteiro incompleto (geração abortada) → NÃO relança com --so-enviar;
-    # alerta pedindo regeneração (evita posts sem imagem/link meli.la)
-    if os.path.exists(roteiro) and not roteiro_completo(roteiro):
+    # alerta pedindo regeneração (evita posts sem imagem/link meli.la).
+    # ⚠️ Só alerta se NENHUM executor estiver rodando — se o executor está ativo,
+    # a geração está EM ANDAMENTO e o roteiro pode estar momentaneamente incompleto.
+    if os.path.exists(roteiro) and not roteiro_completo(roteiro) and not executor_rodando():
         log(f"roteiro INCOMPLETO (cards/links insuficientes) — sem relançamento")
         print(f"🚨 PIPELINE PROMO: roteiro de hoje ({hoje}) está INCOMPLETO "
               f"(cards/links não gerados). Posts sairiam sem imagem e sem link encurtado. "
