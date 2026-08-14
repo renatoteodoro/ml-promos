@@ -17,33 +17,38 @@ import os
 import subprocess
 import sys
 import time
+import fcntl
 from datetime import datetime
 
 REPO = os.path.expanduser("~/ml-promos-repo")
 DIVULGACAO = os.path.expanduser("~/divulgacao")
 PYTHON = sys.executable
 
-# Lock para evitar execuções concorrentes (compartilhado com o executor)
-LOCK_FILE = "/tmp/ml_pipeline.lock"
+# Lock compartilhado COM o executor (flock no mesmo arquivo) — impede que o
+# orquestrador rode enquanto um executor já está ativo (e vice-versa).
+LOCK_FILE = os.path.join(DIVULGACAO, "executor.lock")
 
 
 def adquirir_lock():
-    """Lock de instância única. Retorna True se adquiriu, False se já roda."""
-    if os.path.exists(LOCK_FILE):
-        try:
-            pid = int(open(LOCK_FILE).read().strip())
-            os.kill(pid, 0)
-            return False  # já está rodando
-        except (ProcessLookupError, ValueError):
-            pass
-    with open(LOCK_FILE, "w") as f:
-        f.write(str(os.getpid()))
-    return True
-
-
-def liberar_lock():
+    """Lock de instância única (fcntl flock, MESMO arquivo do executor).
+    Retorna o file object se adquiriu, None se já roda."""
     try:
-        os.remove(LOCK_FILE)
+        lock_file = open(LOCK_FILE, "a+")
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(f"{os.getpid()} {datetime.now().isoformat()}\n")
+        lock_file.flush()
+        return lock_file
+    except OSError:
+        return None
+
+
+def liberar_lock(lock_file):
+    try:
+        if lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+            lock_file.close()
     except OSError:
         pass
 
@@ -65,8 +70,9 @@ def rodar(cmd, timeout=3600):
 
 
 def main():
-    if not adquirir_lock():
-        print("🔒 Outro processo já está rodando — abortando (evita duplicação).")
+    lock_file = adquirir_lock()
+    if not lock_file:
+        print("🔒 Outro processo já está rodando (lock do executor ativo) — abortando (evita duplicação).")
         return 0
 
     hoje = datetime.now().date().isoformat()
@@ -117,7 +123,7 @@ def main():
         print("\n🏁 Pipeline do dia concluído.")
         return 0
     finally:
-        liberar_lock()
+        liberar_lock(lock_file)
 
 
 if __name__ == "__main__":

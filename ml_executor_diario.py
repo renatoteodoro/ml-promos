@@ -399,6 +399,30 @@ def main():
     hoje = datetime.date.today().isoformat()
     json_path = os.path.join(DIVULGACAO, f"roteiro_{hoje}.json")
 
+    # ── GUARDA ANTI-ROTEIRO-INCOMPLETO ──────────────────────────────────────
+    # Se for --so-enviar (ou --dry-run/--forcar-horario que também enviam) e o
+    # roteiro existir mas estiver INCOMPLETO (cards/links ausentes — geração
+    # abortada), NÃO envia: posts sairiam sem imagem e sem link meli.la.
+    if args.so_enviar or args.dry_run or args.forcar_horario:
+        if os.path.exists(json_path):
+            try:
+                with open(json_path) as f:
+                    _d = json.load(f)
+                _cards = _d.get("cards") or []
+                _links = _d.get("links") or []
+                _n_meli = sum(1 for l in _links if l and "meli.la" in l)
+                if len(_cards) < 100 or _n_meli < 100:
+                    print(f"🚫 Roteiro de hoje INCOMPLETO (cards={len(_cards)}, "
+                          f"meli.la={_n_meli}) — NÃO enviando para não postar sem "
+                          f"imagem/link encurtado.")
+                    print("   Regenerar: python3 ml_executor_diario.py --so-links")
+                    return 1
+            except Exception:
+                pass
+        else:
+            print("🚫 Roteiro de hoje NÃO existe — não há o que enviar.")
+            return 1
+
     if args.so_buscar or (not args.so_cards and not args.so_links and not args.so_enviar and not args.dry_run and not args.forcar_horario):
         pass  # fluxo completo
     elif args.so_buscar:

@@ -122,6 +122,29 @@ def dia_completo(roteiro_path, log_exec):
     return False
 
 
+def roteiro_completo(roteiro_path):
+    """True se o roteiro de hoje está COMPLETO (ofertas + cards + links meli.la).
+    Roteiro incompleto (0 cards/0 links) indica geração abortada — NÃO relançar
+    --so-enviar sobre ele (sairia sem imagem/link encurtado)."""
+    try:
+        with open(roteiro_path) as f:
+            d = json.load(f)
+        ofertas = d.get("ofertas") or []
+        cards = d.get("cards") or []
+        links = d.get("links") or []
+        n_meli = sum(1 for l in links if l and "meli.la" in l)
+        # Completo: tem ofertas, cards na mesma ordem e maioria dos links meli.la
+        if not ofertas:
+            return False
+        if len(cards) < 100:
+            return False
+        if n_meli < 100:
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def main():
     agora = datetime.now()
     hhmm = agora.strftime("%H:%M")
@@ -139,6 +162,16 @@ def main():
     if dia_completo(roteiro, log_exec):
         log(f"dia completo ({ultimo_horario_roteiro(roteiro)}) — sem ação")
         return 0
+
+    # CASO 0.5: Roteiro incompleto (geração abortada) → NÃO relança com --so-enviar;
+    # alerta pedindo regeneração (evita posts sem imagem/link meli.la)
+    if os.path.exists(roteiro) and not roteiro_completo(roteiro):
+        log(f"roteiro INCOMPLETO (cards/links insuficientes) — sem relançamento")
+        print(f"🚨 PIPELINE PROMO: roteiro de hoje ({hoje}) está INCOMPLETO "
+              f"(cards/links não gerados). Posts sairiam sem imagem e sem link encurtado. "
+              f"Regenerar: cd ~/ml-promos-repo && python3 ml_executor_diario.py --so-links "
+              f"(após matar executor atual).")
+        return 1
 
     # CASO 1: Roteiro não existe e já passou 07:45 → alerta (precisa ação)
     if not os.path.exists(roteiro) and hhmm >= "07:45":
