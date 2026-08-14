@@ -30,27 +30,28 @@ LOCK_FILE = os.path.join(DIVULGACAO, "executor.lock")
 
 
 def adquirir_lock():
-    """Lock de instância única (fcntl flock, MESMO arquivo do executor).
-    Retorna o file object se adquiriu, None se já roda."""
+    """CHECAGEM de instância única (fcntl flock no MESMO arquivo do executor).
+    O orquestrador NÃO pode segurar o lock enquanto chama o executor (que
+    precisa adquirir o mesmo flock) — então aqui apenas testa se está livre,
+    libera na hora e retorna True/False. Retorna True se NENHUM executor roda."""
     try:
         lock_file = open(LOCK_FILE, "a+")
-        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        lock_file.seek(0)
-        lock_file.truncate()
-        lock_file.write(f"{os.getpid()} {datetime.now().isoformat()}\n")
-        lock_file.flush()
-        return lock_file
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            lock_file.close()
+            return False  # executor ativo — não prosseguir
+        # Conseguiu o flock → está livre. Libera imediatamente (o executor
+        # vai adquirir o próprio lock quando for chamado).
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        lock_file.close()
+        return True
     except OSError:
-        return None
+        return True  # em dúvida, prossegue (o executor aborta se estiver ativo)
 
 
 def liberar_lock(lock_file):
-    try:
-        if lock_file:
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
-            lock_file.close()
-    except OSError:
-        pass
+    pass  # sem lock retido — nada a liberar
 
 
 def rodar(cmd, timeout=3600):
@@ -70,8 +71,7 @@ def rodar(cmd, timeout=3600):
 
 
 def main():
-    lock_file = adquirir_lock()
-    if not lock_file:
+    if not adquirir_lock():
         print("🔒 Outro processo já está rodando (lock do executor ativo) — abortando (evita duplicação).")
         return 0
 
@@ -123,7 +123,7 @@ def main():
         print("\n🏁 Pipeline do dia concluído.")
         return 0
     finally:
-        liberar_lock(lock_file)
+        liberar_lock(None)
 
 
 if __name__ == "__main__":
