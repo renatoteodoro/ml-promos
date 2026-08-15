@@ -258,7 +258,9 @@ async def agendar_envios(posts, dry_run=False, forcar=None, revisar_apos=None):
             # dia sem a mensagem de abertura (era pulada silenciosamente).
             if post.get("tipo") == "abertura" and post["num"] == 1:
                 print(f"  ⏰ Post 1 (abertura) atrasado — enviando MESMO ASSIM (bom dia não morre)")
-                prefixo = "☀️ BOM DIA ATRASADO! (pipeline pegou no tranco) ☀️\n\n"
+                # Sem menção a falha técnica — linguagem natural, como se fosse o
+                # bom dia normal (só marcado como "tarde" pra não parecer erro)
+                prefixo = "☀️ Bom dia! (cheguei mais tarde hoje, mas tô aqui!) ☀️\n\n"
                 post["texto"] = prefixo + post["texto"]
                 espera = 0
                 # envia já (sem sleep); cai no fluxo de envio abaixo
