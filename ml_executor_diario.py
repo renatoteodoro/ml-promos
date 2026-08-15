@@ -253,17 +253,20 @@ async def agendar_envios(posts, dry_run=False, forcar=None, revisar_apos=None):
             fhh, fmm = map(int, forcar.split(":"))
             alvo = agora.replace(hour=fhh, minute=fmm, second=0, microsecond=0)
         if alvo <= agora and not forcar:
-            # REGRA ANTI-BOM-DIA-PERDIDO (15/08): se a ABERTURA (Post 1) estiver
-            # atrasada, envia MESMO ASSIM imediatamente com aviso — não deixa o
-            # dia sem a mensagem de abertura (era pulada silenciosamente).
+            # BOM DIA: somente às 08:00 da manhã, UMA ÚNICA VEZ por dia.
+            # Se atrasou (relançamento pós-08:30 ou já enviado), PULA — nunca
+            # reenvia fora do horário (15/08: watchdog relançou e spammou).
             if post.get("tipo") == "abertura" and post["num"] == 1:
-                print(f"  ⏰ Post 1 (abertura) atrasado — enviando MESMO ASSIM (bom dia não morre)")
-                # Sem menção a falha técnica — linguagem natural, como se fosse o
-                # bom dia normal (só marcado como "tarde" pra não parecer erro)
-                prefixo = "☀️ Bom dia! (cheguei mais tarde hoje, mas tô aqui!) ☀️\n\n"
-                post["texto"] = prefixo + post["texto"]
-                espera = 0
-                # envia já (sem sleep); cai no fluxo de envio abaixo
+                hh_atual = datetime.datetime.now().hour
+                marcador = "/tmp/bom_dia_enviado_hoje"
+                ja_enviado = os.path.exists(marcador)
+                if 8 <= hh_atual <= 10 and not ja_enviado:
+                    print(f"  ⏰ Bom dia atrasado mas ainda de manhã — enviando (1ª e única vez)")
+                    open(marcador, "w").write(datetime.datetime.now().isoformat())
+                    espera = 0
+                else:
+                    print(f"  ⏭️ Post 1 (abertura) — bom dia fora do horário já enviado ou tarde demais, pulando")
+                    continue
             else:
                 print(f"  ⏭️ Post {post['num']} ({post['horario']}) — horário já passou, pulando")
                 continue
