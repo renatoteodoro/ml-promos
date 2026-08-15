@@ -253,8 +253,18 @@ async def agendar_envios(posts, dry_run=False, forcar=None, revisar_apos=None):
             fhh, fmm = map(int, forcar.split(":"))
             alvo = agora.replace(hour=fhh, minute=fmm, second=0, microsecond=0)
         if alvo <= agora and not forcar:
-            print(f"  ⏭️ Post {post['num']} ({post['horario']}) — horário já passou, pulando")
-            continue
+            # REGRA ANTI-BOM-DIA-PERDIDO (15/08): se a ABERTURA (Post 1) estiver
+            # atrasada, envia MESMO ASSIM imediatamente com aviso — não deixa o
+            # dia sem a mensagem de abertura (era pulada silenciosamente).
+            if post.get("tipo") == "abertura" and post["num"] == 1:
+                print(f"  ⏰ Post 1 (abertura) atrasado — enviando MESMO ASSIM (bom dia não morre)")
+                prefixo = "☀️ BOM DIA ATRASADO! (pipeline pegou no tranco) ☀️\n\n"
+                post["texto"] = prefixo + post["texto"]
+                espera = 0
+                # envia já (sem sleep); cai no fluxo de envio abaixo
+            else:
+                print(f"  ⏭️ Post {post['num']} ({post['horario']}) — horário já passou, pulando")
+                continue
         espera = (alvo - datetime.datetime.now()).total_seconds()
         if espera > 0 and not dry_run:
             print(f"  ⏳ Post {post['num']} ({post['horario']}): aguardando {espera/60:.1f} min...")
