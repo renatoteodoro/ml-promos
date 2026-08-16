@@ -258,7 +258,9 @@ async def agendar_envios(posts, dry_run=False, forcar=None, revisar_apos=None):
             # reenvia fora do horário (15/08: watchdog relançou e spammou).
             if post.get("tipo") == "abertura" and post["num"] == 1:
                 hh_atual = datetime.datetime.now().hour
-                marcador = "/tmp/bom_dia_enviado_hoje"
+                # Marcador COM DATA — expira naturalmente por dia (16/08: sem data,
+                # o marcador de ontem pulava o bom dia de hoje indevidamente)
+                marcador = f"/tmp/bom_dia_enviado_{datetime.datetime.now().strftime('%Y-%m-%d')}"
                 ja_enviado = os.path.exists(marcador)
                 if 8 <= hh_atual <= 10 and not ja_enviado:
                     print(f"  ⏰ Bom dia atrasado mas ainda de manhã — enviando (1ª e única vez)")
