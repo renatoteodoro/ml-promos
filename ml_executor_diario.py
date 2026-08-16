@@ -226,18 +226,76 @@ async def bridge_estavel(min_estavel_seg=60):
         return True  # em dúvida, permite (melhor que travar o roteiro)
 
 
+# --- Circuit breaker + timeouts split (Correção 16/08 — GLM 5.3) ---
+# GLOBAIS: persistem entre chamadas de enviar() — o breaker só funciona se o
+# estado for compartilhado entre os posts (senão cada chamada reseta tudo).
+_CB_FALHAS = 0
+_CB_ABERTO_ATE = 0.0
+_CB_LIMITE = 3        # falhas seguidas para abrir
+_CB_ESPERA = 60.0     # segundos com breaker aberto
+_TIMEOUT_CONEXAO = 10  # conexão
+_TIMEOUT_LEITURA = 30  # leitura
+
+
 async def enviar(chat, file_path, caption):
-    """Envia card+caption ou só texto via bridge."""
+    """Envia card+caption ou só texto via bridge. SEMPRE retorna (status, msg), nunca lança exceção."""
+    global _CB_FALHAS, _CB_ABERTO_ATE
     import urllib.request
-    if file_path and os.path.exists(file_path):
-        payload = json.dumps({"chatId": chat, "filePath": file_path, "mediaType": "image", "caption": caption}).encode()
-        req = urllib.request.Request(f"{BRIDGE}/send-media", data=payload, headers={"Content-Type": "application/json"})
-    else:
-        payload = json.dumps({"chatId": chat, "message": caption}).encode()
-        req = urllib.request.Request(f"{BRIDGE}/send", data=payload, headers={"Content-Type": "application/json"})
+    import http.client
+    import random
+    import socket
+
+    class _Conn(http.client.HTTPConnection):
+        def connect(self):
+            super().connect()                       # conecta com timeout de CONEXÃO
+            self.sock.settimeout(_TIMEOUT_LEITURA)  # timeout de LEITURA manual no socket
+
+    class _Handler(urllib.request.HTTPHandler):
+        def http_open(self, req):
+            return self.do_open(_Conn, req)
+
+    _opener = urllib.request.build_opener(_Handler)
+
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            return r.status, r.read().decode()[:100]
+        # --- Circuit breaker: se falhou 3x seguidas, espera 60s antes de tentar ---
+        agora = time.monotonic()
+        if _CB_FALHAS >= _CB_LIMITE:
+            restante = _CB_ABERTO_ATE - agora
+            if restante > 0:
+                print(f"  ⛔ Circuit breaker ativo — aguardando {restante:.0f}s antes de tentar a bridge...")
+                await asyncio.sleep(restante)
+            _CB_FALHAS = 0
+
+        if file_path and os.path.exists(file_path):
+            payload = json.dumps({"chatId": chat, "filePath": file_path,
+                                  "mediaType": "image", "caption": caption}).encode()
+            req = urllib.request.Request(f"{BRIDGE}/send-media", data=payload,
+                                         headers={"Content-Type": "application/json"})
+        else:
+            payload = json.dumps({"chatId": chat, "message": caption}).encode()
+            req = urllib.request.Request(f"{BRIDGE}/send", data=payload,
+                                         headers={"Content-Type": "application/json"})
+
+        ultimo = (500, "nenhuma tentativa concluída")
+        for tentativa in range(3):
+            try:
+                socket.setdefaulttimeout(_TIMEOUT_CONEXAO)  # timeout de CONEXÃO (10s)
+                with _opener.open(req, timeout=_TIMEOUT_CONEXAO) as r:
+                    status, msg = r.status, r.read().decode(errors="replace")[:100]
+                _CB_FALHAS = 0  # sucesso zera falhas consecutivas
+                return status, msg
+            except Exception as e:
+                ultimo = (getattr(e, "code", 500), str(e))
+                print(f"  ⚠️ Tentativa {tentativa+1}/3 falhou: {str(e)[:80]}")
+                if tentativa < 2:  # backoff exponencial + jitter: 1s, 2s, 4s
+                    delay = (2 ** tentativa) + random.uniform(0, 0.3)
+                    await asyncio.sleep(delay)
+
+        # --- Falhou as 3 tentativas: alimenta o circuit breaker ---
+        _CB_FALHAS += 1
+        if _CB_FALHAS >= _CB_LIMITE:
+            _CB_ABERTO_ATE = time.monotonic() + _CB_ESPERA
+        return ultimo
     except Exception as e:
         return 500, str(e)
 
@@ -320,12 +378,29 @@ async def agendar_envios(posts, dry_run=False, forcar=None, revisar_apos=None):
 
     print(f"\n🏁 Concluído: {enviados} posts processados")
 
+GLOBAL_LOCK_PATH = "/tmp/pipeline_global.lock"
+
+
 def adquirir_lock():
-    """Lock de instância única (fcntl flock) — impede 2 executores no mesmo dia.
+    """Lock de instância única + lock GLOBAL compartilhado com o watchdog.
 
     Causa raiz das duplicações/perdas de 10/08: 3 execuções no mesmo dia (A/B/C)
     por relançamento manual. Com o flock, uma 2ª execução aborta na hora.
+    Correção 16/08 (GLM 5.3): lock global em /tmp impede o watchdog de relançar
+    enquanto o executor está vivo (corrida 08:30/08:35 de 16/08).
     """
+    # ---------- 1) LOCK GLOBAL (compartilhado com o watchdog) ----------
+    global_file = open(GLOBAL_LOCK_PATH, "a+")
+    try:
+        fcntl.flock(global_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("🚫 LOCK GLOBAL (/tmp/pipeline_global.lock) ocupado — o watchdog ou outro processo do pipeline está ativo. Abortando para evitar corrida de instâncias.")
+        sys.exit(2)
+    global_file.seek(0, os.SEEK_END)
+    global_file.write(f"[GLOBAL] pid={os.getpid()} {datetime.datetime.now().isoformat()}\n")
+    global_file.flush()
+
+    # ---------- 2) LOCK LOCAL (existente) ----------
     lock_path = os.path.join(DIVULGACAO, "executor.lock")
     lock_file = open(lock_path, "a+")
     try:
@@ -334,10 +409,31 @@ def adquirir_lock():
         print("🚫 JÁ EXISTE um executor rodando (lock ativo). Abortando para evitar posts duplicados/perdidos.")
         print("   Se o relançamento for intencional, mate o processo anterior primeiro:")
         print("   pgrep -af ml_executor_diario  →  kill <PID>")
+        try:
+            fcntl.flock(global_file, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        global_file.close()
         sys.exit(2)
+    lock_file.seek(0, os.SEEK_END)
     lock_file.write(f"{os.getpid()} {datetime.datetime.now().isoformat()}\n")
     lock_file.flush()
-    return lock_file
+
+    return global_file, lock_file
+
+
+def instancia_pipeline_ativa():
+    """True se o lock global estiver ocupado (executor vivo) → NÃO relançar.
+    Usado pelo WATCHDOG antes de matar/relançar."""
+    probe = open(GLOBAL_LOCK_PATH, "a+")
+    try:
+        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(probe, fcntl.LOCK_UN)
+        probe.close()
+        return False
+    except OSError:
+        probe.close()
+        return True
 
 
 def deduplicar_por_slug(ofertas):
@@ -401,6 +497,19 @@ def deduplicar_por_titulo(ofertas):
 
 
 def main():
+    # ── CORREÇÃO 3 (GLM 5.3): log em APPEND com flush por linha — substitui o ">" do shell ──
+    import io
+    log_path = f"/tmp/ml_exec_{datetime.date.today()}.log"
+    try:
+        raw = open(log_path, "ab", buffering=0)
+        log_stream = io.TextIOWrapper(raw, encoding="utf-8", newline="\n",
+                                      line_buffering=True, write_through=True)
+        _stdout_original = sys.stdout
+        sys.stdout = log_stream
+        log_stream.write(f"\n===== REINÍCIO pid={os.getpid()} {datetime.datetime.now().isoformat()} | log={log_path} =====\n")
+    except Exception:
+        pass  # se não conseguir abrir o log, segue com stdout normal
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true", help="Não envia, só mostra")
     ap.add_argument("--forcar-horario", default="", help="Envia tudo agora com este horário")
@@ -411,7 +520,7 @@ def main():
     args = ap.parse_args()
 
     # Lock de instância única — aborta se já houver executor rodando
-    _lock_file = adquirir_lock()
+    _global_lock, _lock_file = adquirir_lock()
 
     hoje = datetime.date.today().isoformat()
     json_path = os.path.join(DIVULGACAO, f"roteiro_{hoje}.json")
