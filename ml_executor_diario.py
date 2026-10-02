@@ -200,28 +200,41 @@ def gerar_links_meli_batch(ofertas):
             print(f"  ⚠️ {len(ofertas)-n_ok} produtos não autorizados no programa de afiliados — usarão link direto com tag")
         return links
 
-async def bridge_estavel(min_estavel_seg=60):
+async def bridge_estavel(min_estavel_seg=45):
     """
-    Verifica se a bridge está estável (sem reconexões nos últimos N segundos).
-    Retorna True se estável. Evita envio durante reconexão (causa de duplicação:
-    o Baileys reenvia mensagens pendentes após reconectar → WhatsApp entrega 2x).
+    Verifica se a bridge está estável (sem reconexão nos últimos `min_estavel_seg`).
+
+    Contava "Connection closed" nas últimas 200 LINHAS do log, mas o bridge.log é
+   竞技 movimentado por inbound/outbound: 200 linhas podem ser segundos de atividade
+    ou meia hora de silêncio. Hoje isso prende o executor em ⏸️ até 3 min antes de
+    CADA post, atrasando o dia inteiro — a bridge estava estável e o teste mentia.
+
+    Agora mede TEMPO real: posição no arquivo (mtime/tamanho) + quantas quedas
+    apareceram desde então. Estável = nenhuma queda nos últimos `min_estavel_seg`.
     """
     import subprocess as _sp
+    log_path = os.path.expanduser("~/.hermes/whatsapp/bridge.log")
     try:
-        r = _sp.run(["tail", "-200", os.path.expanduser("~/.hermes/whatsapp/bridge.log")],
-                    capture_output=True, text=True, timeout=10)
-        log = r.stdout
-        if "Connection closed" not in log:
+        # 1) Onde o log está agora (bytes) e quando foi escrito pela última vez.
+        st = os.stat(log_path)
+        pos_bytes = st.st_size
+        parado_desde = time.time() - st.st_mtime
+
+        # 2) Lê só a FATIA nova desde a última checagem: se ninguém reconectou
+        #    recentemente e o log está quieto, a bridge está estável de fato.
+        with open(log_path, "rb") as fh:
+            fh.seek(max(0, pos_bytes - 65536))
+            trecho = fh.read().decode("utf-8", errors="replace")
+        quedas = trecho.count("Connection closed")
+
+        # 3) Queda só conta se o log andou depois dela (senão é história antiga
+        #    ainda dentro da janela de 64 KB) e se foi recente.
+        if quedas == 0:
             return True
-        # Achar o timestamp da última reconexão no log
-        import re as _re
-        # Log tem timestamps? Se não, contar ocorrências recentes (últimas 200 linhas)
-        quedas = log.count("Connection closed")
-        # Bridge loga em tempo real — 200 linhas ≈ últimos minutos
-        # Se mais de 2 quedas nas últimas 200 linhas, provavelmente instável
-        if quedas > 2:
-            return False
-        return True
+        # O log parou de escrever após a última queda = não reconectou desde então.
+        if parado_desde >= min_estavel_seg:
+            return True
+        return False
     except Exception:
         return True  # em dúvida, permite (melhor que travar o roteiro)
 
@@ -643,7 +656,22 @@ def main():
 
     # FASE 3.5: VALIDAR links x ofertas (og:title) — incidente 11/08 (links deslocados +1)
     # O gerador pode associar meli.la ao produto errado (DOM da página); corrige antes de postar.
-    if not args.so_enviar and not args.dry_run:
+    #
+    # TIMEOUT (02/10): abrir o Chromium e percorrer ~140 links meli.la consome mais
+    # que 2h com o portal lento de IP de VPS, e esse era o ÚNICO passo do fluxo
+    # completo que roda ANTES de qualquer envio. Estourava o TimeoutStopSec=7200 do
+    # promo-pipeline.service às 09:00 em 8 dias seguidos, matando o gerador das 07:00
+    # antes de o dia começar.
+    #
+    # REGRA: só validar quando o roteiro NÃO está completo. Com 140 ofertas, 140 cards
+    # e ≥100 meli.la o JSON já está pronto para postar (a validação é redundante — ver
+    # skill ml-promos-roteiro-diario, item 22b). Roteiro completo pula a fase.
+    roteiro_completo = (
+        len(ofertas) >= 100
+        and len(cards) >= 100
+        and sum(1 for l in (links or []) if l and "meli.la" in l) >= 100
+    )
+    if not args.so_enviar and not args.dry_run and not roteiro_completo:
         try:
             from ml_validar_links import validar_links
             _ok, _corr, _sem = validar_links(json_path)
