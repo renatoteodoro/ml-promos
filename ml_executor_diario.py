@@ -13,22 +13,69 @@ Fluxo:
 Uso: python3 ml_executor_diario.py [--dry-run] [--forcar-horario HH:MM]
 """
 import os, sys, json, time, asyncio, argparse, subprocess, datetime, re, fcntl
+import os as _envos
+MINIMO = int(_envos.environ.get("PROMO_MIN_OFERTAS", "140"))
+MIN_FLOOR = int(_envos.environ.get("PROMO_MIN_FLOOR", "25"))  # chao: nunca zera o grupo
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, parse_qs, urlencode
 
 REPO = os.path.expanduser("~/ml-promos-repo")
 VENV_PY = os.path.expanduser("~/.hermes/hermes-agent/venv/bin/python3")
-DIVULGACAO = os.path.expanduser("~/divulgacao")
-GRUPO = "120363428591609827@g.us"
-BRIDGE = "http://127.0.0.1:3000"
+DIVULGACAO = os.path.abspath(os.path.expanduser(os.environ.get("ML_PROMO_OUTPUT_DIR", "~/divulgacao")))
+GRUPO = os.environ.get("PROMO_GRUPO", "120363428591609827@g.us")
+BRIDGE = os.environ.get("PROMO_BRIDGE", "http://127.0.0.1:3000")
 
 sys.path.insert(0, REPO)
 from ml_promo import extrair_ofertas_html
 from ml_roteiro_diario import HORARIOS, construir_roteiro
-from ml_metrica import filtrar_por_metrica, carregar_historico, registrar_posts, resumo_metrica
+from ml_metrica import (filtrar_por_metrica, carregar_historico, registrar_posts,
+                        resumo_metrica, links_ja_postados_no_cooldown,
+                        REPETICAO_COOLDOWN_DIAS)
 from ml_compare_preco import enriquecer_lote
 from ml_detectar_cupons import processar as detectar_cupons_lote
 
-def buscar_98_ofertas():
-    """Busca ofertas únicas paginando /ofertas até 102+ (14 páginas p/ ter variedade de preço)."""
+AFFILIATE_WORD = "renatoteodoro"
+AFFILIATE_TOOL = "94885465"
+
+
+def link_afiliado_valido(link):
+    """Aceita meli.la oficial ou URL direta com a tag completa do afiliado."""
+    if not isinstance(link, str) or not link:
+        return False
+    try:
+        parts = urlsplit(link)
+        host = (parts.hostname or "").lower()
+        if host == "meli.la" or host.endswith(".meli.la"):
+            return bool(parts.path.strip("/"))
+        query = parse_qs(parts.query)
+        return (
+            host == "mercadolivre.com.br" or host.endswith(".mercadolivre.com.br")
+        ) and query.get("matt_word", [""])[0] == AFFILIATE_WORD and query.get("matt_tool", [""])[0] == AFFILIATE_TOOL
+    except ValueError:
+        return False
+
+
+def link_direto_afiliado(url):
+    """Acrescenta a tag oficial sem remover filtros como pdp_filters=item_id."""
+    if not isinstance(url, str) or not url:
+        return ""
+    try:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+        if not (host == "mercadolivre.com.br" or host.endswith(".mercadolivre.com.br")):
+            return ""
+        query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+                 if k not in ("matt_word", "matt_tool")]
+        query.extend((("matt_word", AFFILIATE_WORD), ("matt_tool", AFFILIATE_TOOL)))
+        return urlunsplit(("https", parts.netloc, parts.path, urlencode(query), parts.fragment))
+    except ValueError:
+        return ""
+
+
+def buscar_98_ofertas(ja_postados=None, ids_postados=None,
+                      cooldown_days=REPETICAO_COOLDOWN_DIAS):
+    """Busca ofertas HTML e completa por API oficial quando a coleta é bloqueada/curta."""
+    from ml_api_source import buscar_ofertas_highlights, catalog_id_from_url
+
     todas, links_vistos = [], set()
     for pg in range(1, 15):
         try:
@@ -36,15 +83,42 @@ def buscar_98_ofertas():
         except Exception as e:
             print(f"  ⚠️ Página {pg}: {e}")
             break
-        novas = [o for o in ofs if o["link"] not in links_vistos]
+        novas = [o for o in ofs if o.get("link") and o["link"] not in links_vistos]
         for o in novas:
             links_vistos.add(o["link"])
         todas.extend(novas)
         print(f"  Página {pg}: +{len(novas)} (total {len(todas)})")
+        if not novas:
+            print("  ⚠️ Nenhuma oferta nova na página; interrompendo a coleta HTML e usando a contingência oficial.")
+            break
         if len(todas) >= 300:
             break
         time.sleep(0.5)
-    return todas
+
+    ja_postados = set(ja_postados or ())
+    ids_postados = {str(x).upper() for x in (ids_postados or ())}
+    novidade = []
+    ids_da_coleta = set()
+    for oferta in todas:
+        pid = catalog_id_from_url(oferta.get("link", ""))
+        if pid:
+            ids_da_coleta.add(pid)
+        if oferta.get("link") not in ja_postados and (not pid or pid not in ids_postados):
+            novidade.append(oferta)
+    if len(novidade) >= 300:
+        return todas
+
+    necessario = max(MINIMO, 300 - len(novidade))
+    print(f"  🔁 Coleta HTML trouxe {len(novidade)} ofertas não repetidas; completando até {necessario} pela API oficial.")
+    api_ofertas = buscar_ofertas_highlights(
+        DIVULGACAO,
+        history_links=ja_postados,
+        extra_ids=ids_postados | ids_da_coleta,
+        limite_ofertas=necessario,
+        cooldown_days=cooldown_days,
+    )
+    print(f"  API oficial acrescentou {len(api_ofertas)} ofertas verificadas.")
+    return todas + api_ofertas
 
 def gerar_cards_batch(ofertas):
     """Gera cards para todas as ofertas (uma sessão Playwright)."""
@@ -61,18 +135,37 @@ def gerar_cards_batch(ofertas):
         page = browser.new_page(viewport={"width": 1080, "height": 1080})
         for i, oferta in enumerate(ofertas):
             try:
-                # Baixar foto
-                foto_url = oferta.get("imagem", "")
+                # Tentar até quatro imagens oficiais do produto, sem publicar card vazio.
+                foto_urls = oferta.get("imagens") or [oferta.get("imagem", "")]
                 foto_b64 = ""
-                if foto_url:
-                    req = urllib.request.Request(foto_url, headers={"User-Agent": "Mozilla/5.0"})
-                    with urllib.request.urlopen(req, timeout=15) as r:
-                        foto_b64 = base64.b64encode(r.read()).decode()
+                foto_mime = ""
+                for foto_url in [u for u in foto_urls if u][:4]:
+                    try:
+                        req = urllib.request.Request(foto_url, headers={
+                            "User-Agent": "Mozilla/5.0",
+                            "Referer": "https://www.mercadolivre.com.br/",
+                            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                        })
+                        with urllib.request.urlopen(req, timeout=15) as r:
+                            raw = r.read()
+                            mime = r.headers.get_content_type()
+                        if not raw:
+                            continue
+                        if not mime.startswith("image/"):
+                            import mimetypes
+                            mime = mimetypes.guess_type(foto_url)[0] or "image/jpeg"
+                        foto_b64 = base64.b64encode(raw).decode()
+                        foto_mime = mime
+                        break
+                    except Exception:
+                        continue
+                if not foto_b64:
+                    raise RuntimeError("não foi possível baixar uma imagem válida do produto")
                 desconto = oferta.get("desconto", 0)
                 frete = oferta.get("frete_gratis", False)
                 badge = f'<span style="position:absolute;top:36px;right:36px;background:#e94560;color:#fff;font-size:64px;font-weight:800;padding:18px 36px;border-radius:20px;font-family:Segoe UI,sans-serif">-{desconto}%</span>' if desconto else ""
                 frete_html = f'<div style="position:absolute;bottom:40px;left:40px;background:#1a7f3f;color:#fff;font-size:40px;font-weight:700;padding:14px 28px;border-radius:16px;font-family:Segoe UI,sans-serif">🚚 FRETE GRÁTIS</div>' if frete else ""
-                html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>*{{margin:0;padding:0;box-sizing:border-box}}body{{background:#fff}}.card{{width:1080px;height:1080px;position:relative;overflow:hidden;display:flex;align-items:center;justify-content:center}}img{{width:100%;height:100%;object-fit:contain;padding:60px}}</style></head><body><div class="card">{f'<img src="data:image/png;base64,{foto_b64}">' if foto_b64 else '<div style="font-size:60px">📦</div>'}{badge}{frete_html}</div></body></html>"""
+                html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>*{{margin:0;padding:0;box-sizing:border-box}}body{{background:#fff}}.card{{width:1080px;height:1080px;position:relative;overflow:hidden;display:flex;align-items:center;justify-content:center}}img{{width:100%;height:100%;object-fit:contain;padding:60px}}</style></head><body><div class="card">{f'<img src="data:{foto_mime};base64,{foto_b64}">' if foto_b64 else '<div style="font-size:60px">📦</div>'}{badge}{frete_html}</div></body></html>"""
                 page.set_content(html, wait_until="load")
                 page.wait_for_timeout(300)
                 path = os.path.join(DIVULGACAO, f"card_dia_{i+1:02d}.png")
@@ -383,11 +476,23 @@ async def agendar_envios(posts, dry_run=False, forcar=None, revisar_apos=None):
             except Exception as e:
                 print(f"  ⚠️ Revisão falhou: {str(e)[:80]}")
 
-    # Registrar links postados no histórico (anti-repetição para amanhã)
+    # Registrar links de afiliado e URLs canônicas no histórico anti-repetição.
     if not dry_run:
-        links_postados = [p.get("texto", "").split("🔗 ")[-1].strip() for p in posts if p.get("tipo") == "oferta" and "🔗 " in p.get("texto", "")]
-        n = registrar_posts(links_postados)
-        print(f"🗂️ {n} links registrados no histórico (anti-repetição)")
+        links_postados = []
+        links_canonicos = []
+        for post in posts:
+            if post.get("tipo") != "oferta":
+                continue
+            texto = post.get("texto", "")
+            if "🔗 " in texto:
+                link = texto.rsplit("🔗 ", 1)[-1].strip().splitlines()[0]
+                if link:
+                    links_postados.append(link)
+            canonical = post.get("link_original")
+            if canonical:
+                links_canonicos.append(canonical)
+        n = registrar_posts(links_postados, links_canonicos=links_canonicos)
+        print(f"🗂️ {n} links de afiliado e {len(links_canonicos)} URLs de catálogo registrados no histórico")
 
     print(f"\n🏁 Concluído: {enviados} posts processados")
 
@@ -456,6 +561,16 @@ def deduplicar_por_slug(ofertas):
     """
     import re as _re
     def slug(link):
+        if not isinstance(link, str) or not link:
+            return ""
+        try:
+            from urllib.parse import urlsplit
+            parts = urlsplit(link).path.strip("/").split("/")
+            for i, part in enumerate(parts[:-1]):
+                if part.lower() == "p" and parts[i + 1].upper().startswith("MLB"):
+                    return "catalog:" + parts[i + 1].upper()
+        except ValueError:
+            pass
         m = _re.search(r"mercadolivre\.com\.br/([^/?]+)", link or "")
         return m.group(1) if m else (link or "")
     vistos = {}
@@ -512,7 +627,7 @@ def deduplicar_por_titulo(ofertas):
 def main():
     # ── CORREÇÃO 3 (GLM 5.3): log em APPEND com flush por linha — substitui o ">" do shell ──
     import io
-    log_path = f"/tmp/ml_exec_{datetime.date.today()}.log"
+    log_path = os.environ.get("ML_PROMO_LOG_PATH", f"/tmp/ml_exec_{datetime.date.today()}.log")
     try:
         raw = open(log_path, "ab", buffering=0)
         log_stream = io.TextIOWrapper(raw, encoding="utf-8", newline="\n",
@@ -525,10 +640,11 @@ def main():
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true", help="Não envia, só mostra")
+    ap.add_argument("--preparar", action="store_true", help="Gera ofertas, cards e links, sem enviar mensagens")
     ap.add_argument("--forcar-horario", default="", help="Envia tudo agora com este horário")
     ap.add_argument("--so-buscar", action="store_true", help="Só busca ofertas e salva JSON")
     ap.add_argument("--so-cards", action="store_true", help="Só gera cards (usa JSON salvo)")
-    ap.add_argument("--so-links", action="store_true", help="Só gera links meli.la (usa JSON salvo)")
+    ap.add_argument("--so-links", action="store_true", help="Só gera links de afiliado (usa JSON salvo; não agenda envios)")
     ap.add_argument("--so-enviar", action="store_true", help="Só agenda/envia (usa JSON salvo)")
     args = ap.parse_args()
 
@@ -536,123 +652,206 @@ def main():
     _global_lock, _lock_file = adquirir_lock()
 
     hoje = datetime.date.today().isoformat()
+    try:
+        os.makedirs(DIVULGACAO, exist_ok=True)
+    except OSError as e:
+        print(f"🚫 Não consegui abrir a pasta de divulgação: {type(e).__name__}: {e}")
+        return 1
     json_path = os.path.join(DIVULGACAO, f"roteiro_{hoje}.json")
 
     # ── GUARDA ANTI-ROTEIRO-INCOMPLETO ──────────────────────────────────────
-    # Se for --so-enviar (ou --dry-run/--forcar-horario que também enviam) e o
-    # roteiro existir mas estiver INCOMPLETO (cards/links ausentes — geração
-    # abortada), NÃO envia: posts sairiam sem imagem e sem link meli.la.
+    # Envio e dry-run exigem o minimo configurado (ofertas, cards e links) afiliados.
     if args.so_enviar or args.dry_run or args.forcar_horario:
-        if os.path.exists(json_path):
-            try:
-                with open(json_path) as f:
-                    _d = json.load(f)
-                _cards = _d.get("cards") or []
-                _links = _d.get("links") or []
-                _n_meli = sum(1 for l in _links if l and "meli.la" in l)
-                if len(_cards) < 100 or _n_meli < 100:
-                    print(f"🚫 Roteiro de hoje INCOMPLETO (cards={len(_cards)}, "
-                          f"meli.la={_n_meli}) — NÃO enviando para não postar sem "
-                          f"imagem/link encurtado.")
-                    print("   Regenerar: python3 ml_executor_diario.py --so-links")
-                    return 1
-            except Exception:
-                pass
-        else:
+        if not os.path.exists(json_path):
             print("🚫 Roteiro de hoje NÃO existe — não há o que enviar.")
             return 1
+        try:
+            with open(json_path, encoding="utf-8") as f:
+                _d = json.load(f)
+            _ofertas = _d.get("ofertas") or []
+            _cards = _d.get("cards") or []
+            _links = _d.get("links") or []
+            _n_cards = sum(1 for card in _cards if card and os.path.isfile(card))
+            _n_afiliados = sum(1 for link in _links if link_afiliado_valido(link))
+        except Exception as e:
+            print(f"🚫 Roteiro inválido: {type(e).__name__}: {e}")
+            return 1
+        if len(_ofertas) < MIN_FLOOR or _n_cards < len(_ofertas) or _n_afiliados < len(_ofertas):
+            print(f"🚫 Roteiro incompleto (ofertas={len(_ofertas)}, cards válidos={_n_cards}, "
+                  f"links afiliados válidos={_n_afiliados}) — NÃO enviando.")
+            print("   Regenerar com: python3 ml_executor_diario.py --preparar")
+            return 1
 
-    if args.so_buscar or (not args.so_cards and not args.so_links and not args.so_enviar and not args.dry_run and not args.forcar_horario):
-        pass  # fluxo completo
-    elif args.so_buscar:
-        pass
+    if args.so_enviar and args.preparar:
+        print("🚫 Use apenas um entre --so-enviar e --preparar.")
+        return 2
 
-    # Fase 1: buscar ofertas (se não tiver JSON ou for fluxo completo)
+    # Fase 1: carregar um roteiro válido ou obter uma nova coleta.
     ofertas = []
+    dados = {}
+    precisa_buscar = args.so_buscar or not os.path.exists(json_path)
+    somente_retomada = args.so_cards or args.so_links or args.so_enviar
+    if somente_retomada and not os.path.exists(json_path):
+        print("🚫 Não existe roteiro do dia para esta retomada; use --preparar primeiro.")
+        return 1
+
     if os.path.exists(json_path) and not args.so_buscar:
-        with open(json_path) as f:
-            dados = json.load(f)
-        ofertas = dados.get("ofertas", [])
-        # DEDUP dupla camada também no JSON salvo (retomada do fluxo)
-        n_antes = len(ofertas)
-        ofertas = deduplicar_por_slug(ofertas)
-        ofertas = deduplicar_por_titulo(ofertas)
-        if len(ofertas) < n_antes:
-            print(f"   🧹 Dedup no JSON: {n_antes - len(ofertas)} duplicatas removidas")
-        print(f"📂 Carregadas {len(ofertas)} ofertas do JSON de {hoje}")
-    else:
+        try:
+            with open(json_path, encoding="utf-8") as f:
+                dados = json.load(f)
+            ofertas = dados.get("ofertas") or []
+        except Exception as e:
+            if somente_retomada:
+                print(f"🚫 JSON do roteiro inválido: {type(e).__name__}: {e}")
+                return 1
+            print(f"⚠️ JSON do roteiro inválido; será feita nova coleta: {type(e).__name__}")
+            precisa_buscar = True
+
+        if len(ofertas) < MINIMO and len(ofertas) >= MIN_FLOOR:
+            print(f"⚠️ Roteiro salvo enxuto ({len(ofertas)} ofertas) usando parcial (chao {MIN_FLOOR}).")
+        elif len(ofertas) < MINIMO:
+            if somente_retomada:
+                print(f"🚫 Roteiro salvo tem apenas {len(ofertas)} ofertas; não vou completar com repetição.")
+                print("   Gere um roteiro novo com: python3 ml_executor_diario.py --preparar")
+                return 1
+            print(f"⚠️ Roteiro salvo incompleto ({len(ofertas)} ofertas); descartando a coleta parcial e buscando de novo.")
+            precisa_buscar = True
+        elif not precisa_buscar:
+            if not (dados.get("cards") or dados.get("links")):
+                n_antes = len(ofertas)
+                ofertas = deduplicar_por_slug(ofertas)
+                ofertas = deduplicar_por_titulo(ofertas)
+                if len(ofertas) < n_antes:
+                    print(f"   🧹 Dedup no JSON parcial: {n_antes - len(ofertas)} duplicatas removidas")
+                    dados["ofertas"] = ofertas
+                    dados["cards"] = []
+                    dados["links"] = []
+            print(f"📂 Carregadas {len(ofertas)} ofertas do JSON de {hoje}")
+
+    if precisa_buscar:
         print("🔍 Buscando ofertas do dia...")
-        ofertas = buscar_98_ofertas()
-        # Aplicar MÉTRICA de preço + anti-repetição (definida 08/08)
         hist = carregar_historico()
-        ja_postados = set(hist.get("links", {}).keys())
-        ofertas = filtrar_por_metrica(ofertas, n_desejado=140, ja_postados=ja_postados)
-        # DEDUP dupla camada (GLM-5.2 10/08): slug (mesmo item) + título (variações do mesmo produto)
+        ja_postados = links_ja_postados_no_cooldown(
+            hist.get("links", {}), cooldown_dias=REPETICAO_COOLDOWN_DIAS
+        )
+        from ml_api_source import published_catalog_ids
+        ids_postados = published_catalog_ids(
+            DIVULGACAO, ja_postados, cooldown_days=REPETICAO_COOLDOWN_DIAS
+        )
+        ja_postados.update(ids_postados)
+        ofertas = buscar_98_ofertas(
+            ja_postados=ja_postados, ids_postados=ids_postados,
+            cooldown_days=REPETICAO_COOLDOWN_DIAS,
+        )
         n_antes = len(ofertas)
+        # Deduplicar antes da seleção para o limite de 140 não cair abaixo dele.
         ofertas = deduplicar_por_slug(ofertas)
         ofertas = deduplicar_por_titulo(ofertas)
         if len(ofertas) < n_antes:
             print(f"   🧹 Dedup: {n_antes - len(ofertas)} duplicatas do mesmo produto removidas")
+        ofertas = filtrar_por_metrica(ofertas, n_desejado=MINIMO, ja_postados=ja_postados)
+        if len(ofertas) < MINIMO and len(ofertas) >= MIN_FLOOR:
+            print(f"⚠️ Coleta enxuta: {len(ofertas)} ofertas (< {MINIMO}). Publicando as validas (grupo nunca fica sem ofertas).")
+        elif len(ofertas) < MINIMO:
+            print(f"🚫 Coleta encerrou com {len(ofertas)} ofertas unicas - abaixo do chao de {MIN_FLOOR}. Nenhuma postagem sera feita.")
+            return 1
         print(f"✅ {len(ofertas)} ofertas selecionadas pela métrica")
         resumo = resumo_metrica(ofertas)
         print(f"   📊 Distribuição: R$20-50={resumo['micro_20_50']} | R$50-100={resumo['core_50_100']} | R$100-200={resumo['corep_100_200']} | R$200-500={resumo['medio_200_500']} | R$500-1000={resumo['oportunidade_500_1000']} | R$1000-3000={resumo['alto_1000_3000']} | R$3000-7000={resumo['premium_3000_7000']} | média R$ {resumo['preco_medio']}")
-        # Comparação de preços: buscar MENOR preço do catálogo (vários vendedores)
-        print("🔎 Comparando preços entre vendedores do mesmo produto (catálogo)...")
-        ofertas = enriquecer_lote(ofertas)
-        resumo2 = resumo_metrica(ofertas)
-        print(f"   📊 Após comparação: média R$ {resumo2['preco_medio']} | R$20-50={resumo2['micro_20_50']} | R$50-100={resumo2['core_50_100']} | R$100-200={resumo2['corep_100_200']} | R$200-500={resumo2['medio_200_500']}")
-        # Detectar cupons ativos nos produtos (ex: "X% OFF com Cupom")
-        print("🎟️ Verificando cupons ativos nos produtos...")
-        try:
-            ofertas = detectar_cupons_lote(ofertas)
-        except Exception as e:
-            print(f"   ⚠️ Detecção de cupons falhou: {str(e)[:80]} (seguindo sem cupons)")
-        with open(json_path, "w") as f:
-            json.dump({"data": hoje, "ofertas": ofertas, "cards": [], "links": []}, f, ensure_ascii=False, indent=1)
 
-    if len(ofertas) < 140:
-        print(f"⚠️ Só {len(ofertas)} ofertas — roteiro poderá usar repetição")
+        # Dados vindos da API já têm preço do menor anúncio e desconto do mesmo vendedor.
+        api_ofertas = [o for o in ofertas if str(o.get("fonte", "")).startswith("ml_api_")]
+        site_ofertas = [o for o in ofertas if not str(o.get("fonte", "")).startswith("ml_api_")]
+        if site_ofertas:
+            print("🔎 Comparando preços de catálogo nas ofertas do site...")
+            site_ofertas = enriquecer_lote(site_ofertas)
+            print(f"   📊 Média após comparação do catálogo: R$ {resumo_metrica(site_ofertas)['preco_medio']}")
+            print("🎟️ Verificando cupons apenas nas páginas de oferta acessíveis...")
+            try:
+                site_ofertas = detectar_cupons_lote(site_ofertas)
+            except Exception as e:
+                print(f"   ⚠️ Detecção de cupons falhou: {str(e)[:80]} (seguindo sem cupons)")
+        ofertas = site_ofertas + api_ofertas
+        dados = {"data": hoje, "ofertas": ofertas, "cards": [], "links": []}
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(dados, f, ensure_ascii=False, indent=1)
 
-    # Fase 2: cards (se não existirem)
-    with open(json_path) as f:
-        dados = json.load(f)
+    if args.so_buscar:
+        print(f"✅ Busca concluída: {len(ofertas)} ofertas salvas em {json_path}; nenhuma mensagem enviada.")
+        return 0
+    if len(ofertas) < MINIMO and len(ofertas) >= MIN_FLOOR:
+        print(f"⚠️ Coleta enxuta ({len(ofertas)} ofertas): montando roteiro parcial (grupo nunca fica sem ofertas).")
+    elif len(ofertas) < MINIMO:
+        print(f"🚫 Só há {len(ofertas)} ofertas únicas (abaixo do chao de {MIN_FLOOR}); o roteiro não será montado nem enviado.")
+        return 1
+
+    # Fase 2: cards. Só aceita imagens realmente baixadas e arquivos existentes.
     cards = dados.get("cards") or []
-    if len(cards) < 140 and not args.so_links and not args.so_enviar:
-        print("🖼️ Gerando cards...")
-        cards = gerar_cards_batch(ofertas)
+    cards_validos = sum(1 for card in cards if card and os.path.isfile(card))
+    if cards_validos < max(MIN_FLOOR, len(ofertas)) and not args.so_links and not args.so_enviar:
+        print(f"🖼️ Gerando cards (válidos no JSON: {cards_validos}/140)...")
+        try:
+            cards = gerar_cards_batch(ofertas)
+        except Exception as e:
+            print(f"🚫 Não consegui abrir o gerador de cards: {type(e).__name__}: {str(e)[:120]}")
+            cards = [None] * len(ofertas)
+        dados["ofertas"] = ofertas
         dados["cards"] = cards
-        with open(json_path, "w") as f:
+        with open(json_path, "w", encoding="utf-8") as f:
             json.dump(dados, f, ensure_ascii=False, indent=1)
+        cards_validos = sum(1 for card in cards if card and os.path.isfile(card))
+    if args.so_cards:
+        print(f"✅ Geração de cards concluída: {cards_validos}/140 arquivos válidos; nenhuma mensagem enviada.")
+        return 0 if cards_validos >= 140 else 1
+    if not args.so_links and cards_validos < max(MIN_FLOOR, len(ofertas)):
+        print(f"🚫 Apenas {cards_validos}/140 cards válidos; não vou gerar um roteiro enviável.")
+        return 1
 
-    # Fase 3: links meli.la (se não existirem)
+    # Fase 3: links oficiais meli.la; se necessário, fallback direto com tag.
     links = dados.get("links") or []
-    if len(links) < 140 and not args.so_enviar:
-        print("🔗 Gerando links meli.la...")
-        links = gerar_links_meli_batch(ofertas)
-        # FALLBACK ANTI-INTERRUPÇÃO: se o portal falhar (sessão expirada/captcha),
-        # usar link direto com tag de afiliado (formato oficial, rastreia igual)
-        if len(links) < 140:
-            print(f"⚠️ Só {len(links)} meli.la gerados — completando com links diretos com tag...")
-            for i, o in enumerate(ofertas):
-                if i < len(links) and links[i]:
-                    continue
-                # Extrair MLB id do link original (aceita /p/MLB e formato de anúncio MLB-XXXXXXXXX-)
-                m = re.search(r"/p/(MLB\d+)", o.get("link", "")) or re.search(r"(MLB-\d{7,})", o.get("link", "")) or re.search(r"(MLB\d{7,})", o.get("link", ""))
-                if m:
-                    mlb_id = m.group(1).replace("-", "")
-                    link_tag = f"https://www.mercadolivre.com.br/p/{mlb_id}?matt_word=renatoteodoro&matt_tool=94885465"
-                    while len(links) <= i:
-                        links.append(None)
-                    links[i] = link_tag
-                else:
-                    while len(links) <= i:
-                        links.append(None)
-                    links[i] = o.get("link", "")
+    links_validos = sum(1 for link in links if link_afiliado_valido(link))
+    if links_validos < 140 and not args.so_enviar:
+        print(f"🔗 Gerando links de afiliado (válidos no JSON: {links_validos}/140)...")
+        try:
+            novos_links = gerar_links_meli_batch(ofertas)
+        except Exception as e:
+            print(f"  ⚠️ Portal de afiliados indisponível ({type(e).__name__}: {str(e)[:100]}); usando fallback direto com tag.")
+            novos_links = [None] * len(ofertas)
+        links = list(links)
+        while len(links) < len(ofertas):
+            links.append(None)
+        for i, oferta in enumerate(ofertas):
+            if link_afiliado_valido(links[i]):
+                continue
+            candidato = novos_links[i] if i < len(novos_links) else None
+            if link_afiliado_valido(candidato):
+                links[i] = candidato
+            else:
+                links[i] = link_direto_afiliado(oferta.get("link", "")) or None
         dados["links"] = links
-        with open(json_path, "w") as f:
+        dados["ofertas"] = ofertas
+        with open(json_path, "w", encoding="utf-8") as f:
             json.dump(dados, f, ensure_ascii=False, indent=1)
-        n_meli = sum(1 for l in links if l and "meli.la" in l)
-        print(f"   ✅ {len(links)} links prontos ({n_meli} meli.la + {len(links)-n_meli} diretos com tag)")
+        n_meli = sum(1 for link in links if isinstance(link, str) and "meli.la/" in link)
+        links_validos = sum(1 for link in links if link_afiliado_valido(link))
+        print(f"   ✅ {links_validos}/{MINIMO} links afiliados válidos ({n_meli} meli.la; restante com tag direta)")
+
+    if args.so_links:
+        print(f"✅ Geração de links concluída: {links_validos}/{MINIMO} válidos; nenhuma mensagem enviada.")
+        return 0 if links_validos >= MINIMO else 1
+    if links_validos < max(MIN_FLOOR, len(ofertas)):
+        print(f"🚫 Apenas {links_validos}/{MINIMO} links afiliados válidos; envio bloqueado.")
+        return 1
+
+    dados["cards"] = cards
+    dados["links"] = links
+    dados["ofertas"] = ofertas
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(dados, f, ensure_ascii=False, indent=1)
+
+    if args.preparar:
+        print(f"✅ Roteiro preparado sem enviar mensagens: {len(ofertas)} ofertas, {cards_validos} cards e {links_validos} links afiliados.")
+        return 0
 
     # FASE 3.5: VALIDAR links x ofertas (og:title) — incidente 11/08 (links deslocados +1)
     # O gerador pode associar meli.la ao produto errado (DOM da página); corrige antes de postar.
@@ -663,13 +862,12 @@ def main():
     # promo-pipeline.service às 09:00 em 8 dias seguidos, matando o gerador das 07:00
     # antes de o dia começar.
     #
-    # REGRA: só validar quando o roteiro NÃO está completo. Com 140 ofertas, 140 cards
-    # e ≥100 meli.la o JSON já está pronto para postar (a validação é redundante — ver
-    # skill ml-promos-roteiro-diario, item 22b). Roteiro completo pula a fase.
+    # Com o minimo configurado (ofertas, cards e links) afiliados válidos, a
+    # validação de página é redundante e falha por bloqueio anti-bot da VPS.
     roteiro_completo = (
-        len(ofertas) >= 100
-        and len(cards) >= 100
-        and sum(1 for l in (links or []) if l and "meli.la" in l) >= 100
+        len(ofertas) >= 140
+        and cards_validos >= 140
+        and links_validos >= 140
     )
     if not args.so_enviar and not args.dry_run and not roteiro_completo:
         try:
@@ -713,4 +911,4 @@ def main():
     asyncio.run(agendar_envios(posts, dry_run=args.dry_run, forcar=args.forcar_horario, revisar_apos=revisar))
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

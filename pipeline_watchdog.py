@@ -12,11 +12,13 @@ refaz cards/links). Silencioso quando tudo está ok.
 
 Uso (cron): python3 pipeline_watchdog.py
 """
+import fcntl
 import json
 import os
 import subprocess
 import sys
 from datetime import datetime, timedelta
+from urllib.parse import urlsplit, parse_qs
 
 REPO = os.path.expanduser("~/ml-promos-repo")
 DIVULGACAO = os.path.expanduser("~/divulgacao")
@@ -33,16 +35,60 @@ def log(msg):
         f.write(f"{datetime.now().strftime('%H:%M:%S')} {msg}\n")
 
 
-def executor_rodando():
-    """True se ml_executor_diario ou ml_pipeline_auto está em execução."""
+def alertar_uma_vez(hoje, chave, mensagem):
+    marcador = f"/tmp/pipeline_watchdog_{hoje}_{chave}.sent"
+    if os.path.exists(marcador):
+        log(f"alerta {chave} já enviado hoje; suprimindo repetição")
+        return False
     try:
-        r = subprocess.run(["pgrep", "-f", "ml_executor_diario.py|ml_pipeline_auto.py"],
-                           capture_output=True, text=True, timeout=10)
-        pids = [p for p in r.stdout.strip().split("\n") if p]
-        # Excluir o próprio watchdog
-        return len(pids) > 0
-    except Exception:
-        return True  # em dúvida, não age (evita duplicação)
+        with open(marcador, "w") as f:
+            f.write(datetime.now().isoformat())
+    except OSError:
+        pass
+    print(mensagem)
+    return True
+
+
+def limpar_alerta(hoje, chave):
+    try:
+        os.unlink(f"/tmp/pipeline_watchdog_{hoje}_{chave}.sent")
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def instancia_pipeline_ativa():
+    """True se outro processo segura o lock global do pipeline."""
+    try:
+        with open("/tmp/pipeline_global.lock", "a+") as probe:
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return True
+            fcntl.flock(probe, fcntl.LOCK_UN)
+            return False
+    except OSError:
+        return True  # falha fechada: não arriscar um segundo executor
+
+
+def executor_rodando():
+    """Detecta os scripts reais em /proc, sem pgrep casar com o próprio watchdog."""
+    targets = {"ml_executor_diario.py", "ml_pipeline_auto.py"}
+    try:
+        for entry in os.scandir("/proc"):
+            if not entry.name.isdigit() or int(entry.name) == os.getpid():
+                continue
+            try:
+                with open(os.path.join(entry.path, "cmdline"), "rb") as f:
+                    argv = [part.decode("utf-8", "ignore") for part in f.read().split(b"\0") if part]
+            except (OSError, ProcessLookupError):
+                continue
+            if any(os.path.basename(arg) in targets for arg in argv):
+                return True
+    except OSError:
+        return True  # em dúvida, não iniciar outro processo
+    return instancia_pipeline_ativa()
 
 
 def ultimo_post_hoje():
@@ -122,25 +168,36 @@ def dia_completo(roteiro_path, log_exec):
     return False
 
 
-def roteiro_completo(roteiro_path):
-    """True se o roteiro de hoje está COMPLETO (ofertas + cards + links meli.la).
-    Roteiro incompleto (0 cards/0 links) indica geração abortada — NÃO relançar
-    --so-enviar sobre ele (sairia sem imagem/link encurtado)."""
+def link_afiliado_valido(link):
+    if not isinstance(link, str) or not link:
+        return False
     try:
-        with open(roteiro_path) as f:
-            d = json.load(f)
-        ofertas = d.get("ofertas") or []
-        cards = d.get("cards") or []
-        links = d.get("links") or []
-        n_meli = sum(1 for l in links if l and "meli.la" in l)
-        # Completo: tem ofertas, cards na mesma ordem e maioria dos links meli.la
-        if not ofertas:
-            return False
-        if len(cards) < 100:
-            return False
-        if n_meli < 100:
-            return False
-        return True
+        parts = urlsplit(link)
+        host = (parts.hostname or "").lower()
+        if (host == "meli.la" or host.endswith(".meli.la")) and parts.path.strip("/"):
+            return True
+        query = parse_qs(parts.query)
+        return (
+            (host == "mercadolivre.com.br" or host.endswith(".mercadolivre.com.br"))
+            and query.get("matt_word", [""])[0] == "renatoteodoro"
+            and query.get("matt_tool", [""])[0] == "94885465"
+        )
+    except ValueError:
+        return False
+
+
+def roteiro_completo(roteiro_path):
+    """Aceita roteiro completo ou enxuto acima do piso, sempre com card e link por oferta."""
+    try:
+        with open(roteiro_path, encoding="utf-8") as f:
+            dados = json.load(f)
+        ofertas = dados.get("ofertas") or []
+        cards = dados.get("cards") or []
+        links = dados.get("links") or []
+        n_cards = sum(1 for card in cards if card and os.path.isfile(card))
+        n_links = sum(1 for link in links if link_afiliado_valido(link))
+        piso = int(os.environ.get("PROMO_MIN_FLOOR", "25"))
+        return len(ofertas) >= piso and n_cards >= len(ofertas) and n_links >= len(ofertas)
     except Exception:
         return False
 
@@ -158,28 +215,36 @@ def main():
     roteiro = os.path.join(DIVULGACAO, f"roteiro_{hoje}.json")
     log_exec = f"/tmp/ml_exec_{hoje}.log"
 
+    if roteiro_completo(roteiro):
+        limpar_alerta(hoje, "incompleto")
+        limpar_alerta(hoje, "ausente")
+
     # CASO 0: Dia já completou (último post do roteiro enviado) → SILENCIOSO, não relança
     if dia_completo(roteiro, log_exec):
         log(f"dia completo ({ultimo_horario_roteiro(roteiro)}) — sem ação")
         return 0
 
-    # CASO 0.5: Roteiro incompleto (geração abortada) → NÃO relança com --so-enviar;
-    # alerta pedindo regeneração (evita posts sem imagem/link meli.la).
-    # ⚠️ Só alerta se NENHUM executor estiver rodando — se o executor está ativo,
-    # a geração está EM ANDAMENTO e o roteiro pode estar momentaneamente incompleto.
+    # Roteiro incompleto só é falha quando não há preparação ativa; alertar uma vez.
     if os.path.exists(roteiro) and not roteiro_completo(roteiro) and not executor_rodando():
-        log(f"roteiro INCOMPLETO (cards/links insuficientes) — sem relançamento")
-        print(f"🚨 PIPELINE PROMO: roteiro de hoje ({hoje}) está INCOMPLETO "
-              f"(cards/links não gerados). Posts sairiam sem imagem e sem link encurtado. "
-              f"Regenerar: cd ~/ml-promos-repo && python3 ml_executor_diario.py --so-links "
-              f"(após matar executor atual).")
-        return 1
+        log("roteiro INCOMPLETO (ofertas/cards/links inválidos) — sem relançamento")
+        alertar_uma_vez(
+            hoje,
+            "incompleto",
+            f"🚨 PIPELINE PROMO: roteiro de hoje ({hoje}) está INCOMPLETO "
+            f"(ofertas abaixo do piso ou cards/links inválidos). Nenhuma mensagem será enviada. "
+            f"Regenerar com: cd ~/ml-promos-repo && python3 ml_executor_diario.py --preparar",
+        )
+        return 0
 
-    # CASO 1: Roteiro não existe e já passou 07:45 → alerta (precisa ação)
-    if not os.path.exists(roteiro) and hhmm >= "07:45":
-        print(f"🚨 PIPELINE PROMO: roteiro de hoje ({hoje}) NÃO foi gerado! "
-              f"Verifique o cron das 07:00 e os logs. O grupo ficará sem ofertas hoje.")
-        return 1
+    # Sem roteiro após 07:45 só é alerta se a preparação realmente parou.
+    if not os.path.exists(roteiro) and hhmm >= "07:45" and not executor_rodando():
+        alertar_uma_vez(
+            hoje,
+            "ausente",
+            f"🚨 PIPELINE PROMO: roteiro de hoje ({hoje}) não foi gerado. "
+            f"Nenhuma mensagem será enviada até a preparação completar.",
+        )
+        return 0
 
     # CASO 2: Executor morto em janela de envio → relança
     if not executor_rodando():
@@ -205,15 +270,19 @@ def main():
                 print(f"❌ Não consegui relançar: {e}")
             return 0
 
-    # CASO 3: Gap longo (executor vivo mas travado?) → relança
+    # CASO 3: Gap longo (executor vivo mas travado?) → alerta uma vez, sem marcar erro no cron
     if executor_rodando():
         ultimo = ultimo_post_hoje()
         if ultimo and (agora - ultimo).total_seconds() > 45 * 60 and hhmm < "23:00":
-            log(f"gap de {(agora-ultimo).total_seconds()/60:.0f} min — executor pode estar travado")
-            print(f"⚠️ Pipeline Promo: {((agora-ultimo).total_seconds()/60):.0f} min sem post — verificando...")
-            # Não mata o executor (evita duplicação); apenas alerta
-            print("🔍 Executor ainda vivo — monitorando. Se não voltar, relançar manualmente.")
-            return 1
+            minutos = (agora - ultimo).total_seconds() / 60
+            log(f"gap de {minutos:.0f} min — executor pode estar travado")
+            alertar_uma_vez(
+                hoje,
+                "gap",
+                f"⚠️ Promo das Galáxias: sem postagem há {minutos:.0f} min; o executor segue ativo. Verificar o log antes de reiniciar.",
+            )
+            return 0
+        limpar_alerta(hoje, "gap")
 
     # Tudo ok — silencioso
     return 0

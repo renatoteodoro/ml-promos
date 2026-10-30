@@ -15,9 +15,17 @@ import json, os, sys, time, hashlib
 # 35 ciclos de 4 ofertas: 5 min entre ofertas do mesmo ciclo e pausas
 # maiores de 10/11 min entre ciclos. Abertura e encerramento incluídos.
 def _gerar_horarios(n_ofertas=140):
+    import os as _os
     from datetime import datetime, timedelta
-    inicio = datetime.strptime("08:00", "%H:%M")
-    fim = datetime.strptime("23:00", "%H:%M")
+    inicio = datetime.strptime(_os.environ.get("PROMO_HORA_INICIO", "08:00"), "%H:%M")
+    fim = datetime.strptime(_os.environ.get("PROMO_HORA_FIM", "23:00"), "%H:%M")
+    enumerar = max(1, n_ofertas + 2)  # abertura + ofertas + encerramento
+    if n_ofertas < 140:
+        # Dia enxuto: distribui uniformemente no intervalo inteiro (>= 5 min), sem rajada.
+        total = int((fim - inicio).total_seconds())
+        passo = max(300, total // (enumerar - 1))
+        slots = [inicio + timedelta(seconds=passo * i) for i in range(enumerar)]
+        return [h.strftime("%H:%M") for h in slots]
     ciclo = 4
     ciclos = (n_ofertas + ciclo - 1) // ciclo
     horarios = [inicio]
@@ -196,12 +204,12 @@ def distribuir_ofertas(ofertas, n=140):
     Retorna lista de ofertas na ordem de postagem.
     """
     # Classificar por faixa (7 faixas — revisão de conversão 12/08)
-    f_micro = sorted([o for o in ofertas if 20 <= o["preco"] <= 50], key=lambda o: -(o.get("desconto") or 0))
+    f_micro = sorted([o for o in ofertas if o["preco"] <= 50], key=lambda o: -(o.get("desconto") or 0))
     f_core = sorted([o for o in ofertas if 50 < o["preco"] <= 100], key=lambda o: -(o.get("desconto") or 0))
     f_corep = sorted([o for o in ofertas if 100 < o["preco"] <= 200], key=lambda o: -(o.get("desconto") or 0))
     f_medio = sorted([o for o in ofertas if 200 < o["preco"] <= 500], key=lambda o: -(o.get("desconto") or 0))
     f_oport = sorted([o for o in ofertas if 500 < o["preco"] <= 1000], key=lambda o: -(o.get("desconto") or 0))
-    f_alto = sorted([o for o in ofertas if 1000 < o["preco"] <= 3000], key=lambda o: -(o.get("desconto") or 0))
+    f_alto = sorted([o for o in ofertas if o["preco"] > 1000], key=lambda o: -(o.get("desconto") or 0))
     f_premium = sorted([o for o in ofertas if 3000 < o["preco"] <= 7000], key=lambda o: -(o.get("desconto") or 0))
     faixas = {"micro": f_micro, "core": f_core, "corep": f_corep, "medio": f_medio,
               "oport": f_oport, "alto": f_alto, "premium": f_premium}
@@ -277,21 +285,27 @@ def distribuir_ofertas(ofertas, n=140):
                     ordem.append(o)
     return ordem[:n]
 
-def construir_roteiro(ofertas, data, dia_idx=0, cards=None, links=None, chamadas=None):
-    """Monta o roteiro completo de 142 mensagens: abertura + 140 ofertas + encerramento."""
+def construir_roteiro(ofertas, data, dia_idx=0, cards=None, links=None, chamadas=None, minimo=None):
+    """Monta o roteiro completo: abertura + ofertas + encerramento (suporta dia enxuto)."""
+    _osm = __import__("os")
+    MINIMO = int(_osm.environ.get("PROMO_MIN_OFERTAS", "140")) if minimo is None else int(minimo)
+    HORARIOS_DIA = _gerar_horarios(max(1, len(ofertas)))
+    MIN_FLOOR = int(_osm.environ.get("PROMO_MIN_FLOOR", "25"))
+    if len(ofertas) < MIN_FLOOR:
+        raise ValueError(f"Roteiro abaixo do piso operacional: {len(ofertas)} ofertas; mínimo seguro: {MIN_FLOOR}.")
     chamadas_pool = chamadas if chamadas else gerar_chamadas()
     posts = []
 
     # Post 1 — Abertura
     abertura = ABERTURAS[dia_idx % len(ABERTURAS)]
-    posts.append({"num": 1, "horario": HORARIOS[0], "tipo": "abertura", "texto": abertura, "card": None})
+    posts.append({"num": 1, "horario": HORARIOS_DIA[0], "tipo": "abertura", "texto": abertura, "card": None})
 
     # Posts 2-141 — 140 ofertas reais, distribuídas de forma equilibrada
-    ordem = distribuir_ofertas(ofertas, n=140)
+    ordem = distribuir_ofertas(ofertas, n=len(ofertas))
     # MAPA: link original da oferta → índice no array (para casar card/link corretos)
     indice_por_link = {o.get("link", ""): i for i, o in enumerate(ofertas)}
     n_ofertas = len(ordem)
-    for i in range(140):
+    for i in range(len(ofertas)):
         oferta = ordem[i % n_ofertas]
         # Índice ORIGINAL da oferta (a distribuição reordena! card/link/chamada precisam do índice original)
         idx_orig = indice_por_link.get(oferta.get("link", ""), i % len(ofertas))
@@ -346,11 +360,13 @@ def construir_roteiro(ofertas, data, dia_idx=0, cards=None, links=None, chamadas
         card_path = None
         if cards and idx_orig < len(cards) and cards[idx_orig]:
             card_path = cards[idx_orig]
-        posts.append({"num": i+2, "horario": HORARIOS[i+1], "tipo": "oferta", "texto": texto, "card": card_path})
+        posts.append({"num": i+2, "horario": HORARIOS_DIA[i+1], "tipo": "oferta", "texto": texto, "card": card_path,
+                      "link_original": oferta.get("link", ""),
+                      "catalog_id": oferta.get("catalog_id") or oferta.get("product_id", "")})
 
-    # Post 142 — Encerramento (23:00)
+    # Post final — Encerramento (nativo: lentidao e dia curto usam o ultimo slot)
     encerramento = ENCERRAMENTOS[dia_idx % len(ENCERRAMENTOS)]
-    posts.append({"num": 142, "horario": HORARIOS[141], "tipo": "encerramento", "texto": encerramento, "card": None})
+    posts.append({"num": len(posts)+1, "horario": HORARIOS_DIA[-1], "tipo": "encerramento", "texto": encerramento, "card": None})
 
     return posts
 
@@ -358,6 +374,6 @@ if __name__ == "__main__":
     print(f"Roteiro: {len(HORARIOS)} horários | {len(ABERTURAS)} aberturas | {len(ENCERRAMENTOS)} encerramentos | {len(gerar_chamadas())} chamadas")
     # Verificar horários
     for i, h in enumerate(HORARIOS):
-        if i < len(HORARIOS)-1 and h >= HORARIOS[i+1]:
-            print(f"⚠️ Horário fora de ordem: {h} antes de {HORARIOS[i+1]}")
+        if i < len(HORARIOS)-1 and h >= HORARIOS_DIA[i+1]:
+            print(f"⚠️ Horário fora de ordem: {h} antes de {HORARIOS_DIA[i+1]}")
     print(f"✅ {len(HORARIOS)} horários em ordem crescente (08:00 → 22:00)")
