@@ -176,6 +176,15 @@ def gerar_chamadas():
     ]
     return padroes
 
+
+CHAMADAS_NATAL = [
+    "🎄 ENFEITE A CASA GASTANDO MENOS!",
+    "✨ O CLIMA DE NATAL COMEÇA AQUI!",
+    "🎁 PRESENTE E DECORAÇÃO EM PROMOÇÃO!",
+    "🌟 DEIXE O NATAL MAIS BONITO!",
+]
+
+
 def fmt_preco(valor):
     """Formata preço sem centavos quando inteiro (R$ 603 em vez de R$ 603,00)."""
     if valor == int(valor):
@@ -283,6 +292,14 @@ def distribuir_ofertas(ofertas, n=140):
                             contadores[k] = max(contadores[k], lista.index(o) + 1)
                             break
                     ordem.append(o)
+    natal = [o for o in ordem if o.get("promo_sazonal") == "natal"]
+    if natal:
+        regulares = [o for o in ordem if o.get("promo_sazonal") != "natal"]
+        for indice, oferta in enumerate(natal, start=1):
+            # Mantém os sazonais no meio do expediente, sem concentrá-los.
+            posicao = round(indice * len(regulares) / (len(natal) + 1)) + indice - 1
+            regulares.insert(min(posicao, len(regulares)), oferta)
+        ordem = regulares
     return ordem[:n]
 
 def construir_roteiro(ofertas, data, dia_idx=0, cards=None, links=None, chamadas=None, minimo=None):
@@ -310,6 +327,8 @@ def construir_roteiro(ofertas, data, dia_idx=0, cards=None, links=None, chamadas
         # Índice ORIGINAL da oferta (a distribuição reordena! card/link/chamada precisam do índice original)
         idx_orig = indice_por_link.get(oferta.get("link", ""), i % len(ofertas))
         chamada = chamadas_pool[idx_orig % len(chamadas_pool)] if chamadas_pool else "🔥 OFERTA!"
+        if oferta.get("promo_sazonal") == "natal":
+            chamada = CHAMADAS_NATAL[idx_orig % len(CHAMADAS_NATAL)]
         nome = resumir_titulo(oferta["titulo"])
         # Preços formatados
         preco = fmt_preco(oferta["preco"])

@@ -24,6 +24,75 @@ DIVULGACAO = os.path.abspath(os.path.expanduser(os.environ.get("ML_PROMO_OUTPUT_
 GRUPO = os.environ.get("PROMO_GRUPO", "120363428591609827@g.us")
 BRIDGE = os.environ.get("PROMO_BRIDGE", "http://127.0.0.1:3000")
 BRIDGE_TOKEN_FILE = os.path.expanduser("~/.hermes/whatsapp/session/.bridge-token")
+NATAL_FIM = datetime.date(2026, 12, 20)
+NATAL_MAXIMO_DIARIO = int(os.environ.get("PROMO_NATAL_MAXIMO", "4"))
+NATAL_TERMOS = (
+    "natal", "pisca-pisca", "pisca pisca", "guirlanda", "presépio",
+)
+
+
+def natal_ativo(data=None):
+    try:
+        atual = datetime.date.fromisoformat(str(data)[:10]) if data else datetime.date.today()
+    except ValueError:
+        atual = datetime.date.today()
+    return atual <= NATAL_FIM
+
+
+def eh_oferta_natal(oferta):
+    titulo = str(oferta.get("titulo", "")).casefold()
+    return any(termo in titulo for termo in NATAL_TERMOS)
+
+
+def selecionar_ofertas_com_natal(ofertas, n_desejado, ja_postados, data):
+    """Reserva até quatro enfeites natalinos e devolve o restante pela métrica."""
+    if not natal_ativo(data):
+        return filtrar_por_metrica(ofertas, n_desejado=n_desejado, ja_postados=ja_postados)
+
+    natal = [o for o in ofertas if eh_oferta_natal(o)]
+    sazonais = filtrar_por_metrica(
+        natal,
+        n_desejado=min(NATAL_MAXIMO_DIARIO, n_desejado),
+        ja_postados=ja_postados,
+    )
+    chaves_sazonais = {
+        str(o.get("catalog_id") or o.get("product_id") or o.get("link", ""))
+        for o in sazonais
+    }
+    gerais = [
+        o for o in ofertas
+        if not eh_oferta_natal(o)
+        and str(o.get("catalog_id") or o.get("product_id") or o.get("link", ""))
+        not in chaves_sazonais
+    ]
+    restantes = filtrar_por_metrica(
+        gerais,
+        n_desejado=max(0, n_desejado - len(sazonais)),
+        ja_postados=ja_postados,
+    )
+    selecionadas = sazonais + restantes
+    selecionadas_chaves = {
+        str(o.get("catalog_id") or o.get("product_id") or o.get("link", ""))
+        for o in selecionadas
+    }
+    if len(selecionadas) < n_desejado:
+        base = filtrar_por_metrica(
+            [o for o in ofertas if not eh_oferta_natal(o)],
+            n_desejado=n_desejado,
+            ja_postados=ja_postados,
+        )
+        for oferta in base:
+            chave = str(oferta.get("catalog_id") or oferta.get("product_id") or oferta.get("link", ""))
+            if chave not in selecionadas_chaves:
+                selecionadas.append(oferta)
+                selecionadas_chaves.add(chave)
+            if len(selecionadas) >= n_desejado:
+                break
+
+    for oferta in selecionadas:
+        if eh_oferta_natal(oferta):
+            oferta["promo_sazonal"] = "natal"
+    return selecionadas[:n_desejado]
 
 
 def bridge_headers():
@@ -88,8 +157,9 @@ def link_direto_afiliado(url):
 def buscar_98_ofertas(ja_postados=None, ids_postados=None,
                       cooldown_days=REPETICAO_COOLDOWN_DIAS):
     """Busca ofertas HTML e completa por API oficial quando a coleta é bloqueada/curta."""
-    from ml_api_source import buscar_ofertas_highlights, catalog_id_from_url
+    from ml_api_source import buscar_ofertas_highlights, catalog_id_from_url, PESQUISAS_NATALINAS
 
+    termos_prioritarios = PESQUISAS_NATALINAS if natal_ativo() else ()
     todas, links_vistos = [], set()
     for pg in range(1, 15):
         try:
@@ -130,6 +200,7 @@ def buscar_98_ofertas(ja_postados=None, ids_postados=None,
         extra_ids=ids_postados | ids_da_coleta,
         limite_ofertas=necessario,
         cooldown_days=cooldown_days,
+        termos_prioritarios=termos_prioritarios,
     )
     print(f"  API oficial acrescentou {len(api_ofertas)} ofertas verificadas.")
     return todas + api_ofertas
@@ -763,7 +834,12 @@ def main():
         ofertas = deduplicar_por_titulo(ofertas)
         if len(ofertas) < n_antes:
             print(f"   🧹 Dedup: {n_antes - len(ofertas)} duplicatas do mesmo produto removidas")
-        ofertas = filtrar_por_metrica(ofertas, n_desejado=MINIMO, ja_postados=ja_postados)
+        ofertas = selecionar_ofertas_com_natal(
+            ofertas,
+            n_desejado=MINIMO,
+            ja_postados=ja_postados,
+            data=hoje,
+        )
         if len(ofertas) < MINIMO and len(ofertas) >= MIN_FLOOR:
             print(f"⚠️ Coleta enxuta: {len(ofertas)} ofertas (< {MINIMO}). Publicando as validas (grupo nunca fica sem ofertas).")
         elif len(ofertas) < MINIMO:
