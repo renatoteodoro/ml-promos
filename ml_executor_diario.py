@@ -23,6 +23,20 @@ VENV_PY = os.path.expanduser("~/.hermes/hermes-agent/venv/bin/python3")
 DIVULGACAO = os.path.abspath(os.path.expanduser(os.environ.get("ML_PROMO_OUTPUT_DIR", "~/divulgacao")))
 GRUPO = os.environ.get("PROMO_GRUPO", "120363428591609827@g.us")
 BRIDGE = os.environ.get("PROMO_BRIDGE", "http://127.0.0.1:3000")
+BRIDGE_TOKEN_FILE = os.path.expanduser("~/.hermes/whatsapp/session/.bridge-token")
+
+
+def bridge_headers():
+    headers = {"Content-Type": "application/json"}
+    try:
+        with open(BRIDGE_TOKEN_FILE, encoding="utf-8") as f:
+            token = f.read().strip()
+    except OSError:
+        token = ""
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
 
 sys.path.insert(0, REPO)
 from ml_promo import extrair_ofertas_html
@@ -376,11 +390,11 @@ async def enviar(chat, file_path, caption):
             payload = json.dumps({"chatId": chat, "filePath": file_path,
                                   "mediaType": "image", "caption": caption}).encode()
             req = urllib.request.Request(f"{BRIDGE}/send-media", data=payload,
-                                         headers={"Content-Type": "application/json"})
+                                         headers=bridge_headers())
         else:
             payload = json.dumps({"chatId": chat, "message": caption}).encode()
             req = urllib.request.Request(f"{BRIDGE}/send", data=payload,
-                                         headers={"Content-Type": "application/json"})
+                                         headers=bridge_headers())
 
         ultimo = (500, "nenhuma tentativa concluída")
         for tentativa in range(3):
