@@ -25,9 +25,11 @@ GRUPO = os.environ.get("PROMO_GRUPO", "120363428591609827@g.us")
 BRIDGE = os.environ.get("PROMO_BRIDGE", "http://127.0.0.1:3000")
 BRIDGE_TOKEN_FILE = os.path.expanduser("~/.hermes/whatsapp/session/.bridge-token")
 NATAL_FIM = datetime.date(2026, 12, 20)
-NATAL_MAXIMO_DIARIO = int(os.environ.get("PROMO_NATAL_MAXIMO", "4"))
+NATAL_PERCENTUAL = float(os.environ.get("PROMO_NATAL_PERCENTUAL", "0.40"))
 NATAL_TERMOS = (
-    "natal", "pisca-pisca", "pisca pisca", "guirlanda", "presépio",
+    "natal", "enfeite", "ornamento", "árvore de natal", "pisca-pisca",
+    "pisca pisca", "luzes de natal", "guirlanda", "presépio",
+    "bola de natal", "fita natalina", "estrela de natal",
 )
 
 
@@ -45,14 +47,16 @@ def eh_oferta_natal(oferta):
 
 
 def selecionar_ofertas_com_natal(ofertas, n_desejado, ja_postados, data):
-    """Reserva até quatro enfeites natalinos e devolve o restante pela métrica."""
+    """Reserva 40% das ofertas para enfeites natalinos, quando disponíveis."""
     if not natal_ativo(data):
         return filtrar_por_metrica(ofertas, n_desejado=n_desejado, ja_postados=ja_postados)
 
+    percentual = min(max(NATAL_PERCENTUAL, 0.0), 1.0)
+    meta_natal = min(n_desejado, int(round(n_desejado * percentual)))
     natal = [o for o in ofertas if eh_oferta_natal(o)]
     sazonais = filtrar_por_metrica(
         natal,
-        n_desejado=min(NATAL_MAXIMO_DIARIO, n_desejado),
+        n_desejado=meta_natal,
         ja_postados=ja_postados,
     )
     chaves_sazonais = {
@@ -92,6 +96,11 @@ def selecionar_ofertas_com_natal(ofertas, n_desejado, ja_postados, data):
     for oferta in selecionadas:
         if eh_oferta_natal(oferta):
             oferta["promo_sazonal"] = "natal"
+    natal_selecionadas = sum(1 for oferta in selecionadas if oferta.get("promo_sazonal") == "natal")
+    percentual_real = natal_selecionadas / max(len(selecionadas), 1)
+    print(f"🎄 Natal: {natal_selecionadas}/{len(selecionadas)} ofertas ({percentual_real:.0%} quando há candidatos válidos) | meta {meta_natal}/{n_desejado}")
+    if natal_selecionadas < meta_natal:
+        print(f"⚠️ Natal: só {natal_selecionadas} candidatos válidos passaram pelos filtros; não vou repetir nem inventar ofertas.")
     return selecionadas[:n_desejado]
 
 
