@@ -22,11 +22,15 @@ STATE_FILE = os.path.join(DIVULGACAO, "promo-galaxias", "insta_state.json")
 STORY_ENDPOINT = "http://127.0.0.1:8651/api/instagram-story"
 
 
-def load_state():
+def load_state(today=None):
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
-            return json.load(f)
-    return {"postados": [], "stories_postados": []}
+            state = json.load(f)
+        # Os índices pertencem ao roteiro do dia, não podem bloquear dias futuros.
+        if today is not None and state.get("date") != today:
+            return {"date": today, "postados": [], "stories_postados": []}
+        return state
+    return {"date": today, "postados": [], "stories_postados": []}
 
 
 def save_state(state):
@@ -111,7 +115,7 @@ def main():
     cards = dados.get("cards", [])
 
     # Selecionar: --post N ou primeira oferta com card não usada em story
-    state = load_state()
+    state = load_state(hoje)
     stories = set(state.get("stories_postados", []))
 
     if "--post" in sys.argv:

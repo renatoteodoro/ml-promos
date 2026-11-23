@@ -37,6 +37,10 @@ def main():
     else:
         state = {}
 
+    # Os índices só valem para o roteiro do dia atual.
+    if state.get("date") != hoje:
+        state = {"date": hoje, "postados": [], "stories_postados": []}
+
     postados = set(state.get("postados", []))
     stories = set(state.get("stories_postados", []))
     hora_atual = agora.strftime("%H:%M")

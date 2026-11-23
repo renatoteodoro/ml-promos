@@ -25,11 +25,15 @@ GRUPO_LINK = "https://chat.whatsapp.com/D465pHVNJpE4WRdyIzaf4m"
 HASHTAGS = "#PromoDasGalaxias #OfertasDoDia #Promoção #MercadoLivre #Economize #Descontos #ComprasInteligentes"
 
 
-def load_state():
+def load_state(today=None):
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
-            return json.load(f)
-    return {"postados": []}
+            state = json.load(f)
+        # Os índices pertencem ao roteiro do dia, não podem bloquear dias futuros.
+        if today is not None and state.get("date") != today:
+            return {"date": today, "postados": [], "stories_postados": []}
+        return state
+    return {"date": today, "postados": [], "stories_postados": []}
 
 
 def save_state(state):
@@ -77,7 +81,7 @@ def main():
     links = dados.get("links", [])
 
     # Selecionar post: --post N ou primeiro não postado
-    state = load_state()
+    state = load_state(hoje)
     postados = set(state.get("postados", []))
 
     if "--post" in sys.argv:
