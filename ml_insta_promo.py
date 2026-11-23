@@ -134,19 +134,9 @@ def main():
         print(f"\n🧪 [DRY RUN] caption:\n{caption}\n")
         return 0
 
-    # Upload da imagem para URL pública (litterbox)
-    import subprocess
-    r = subprocess.run(["curl", "-s", "-m", "60", "-F", "reqtype=fileupload",
-                        "-F", "time=24h", "-F", f"fileToUpload=@{card}",
-                        "https://litterbox.catbox.moe/resources/internals/api.php"],
-                       capture_output=True, text=True, check=False)
-    public_url = r.stdout.strip()
-    if not public_url.startswith("http"):
-        print(f"❌ Upload falhou: {r.stdout[:100]}")
-        return 1
-    print(f"   📤 Imagem: {public_url[:60]}")
-
-    result = publicar(public_url, caption)
+    # Envia o caminho local ao post-server, que faz o upload com fallback.
+    # Assim a falha de um host público não interrompe o cron antes da API.
+    result = publicar(card, caption)
     print(f"✅ PUBLICADO: {result}")
 
     state["postados"] = sorted(postados | {idx})
