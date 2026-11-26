@@ -15,12 +15,28 @@ Prioridade de preço (baseada em densidade do catálogo + desconto + comissão):
 
 Anti-repetição:
 - Histórico em ~/divulgacao/historico_ofertas.json (links já postados)
-- Nunca repetir produto já postado em dias anteriores
+- Nunca repetir produto nos 30 dias seguintes à divulgação
+- Após 30 dias, pode voltar a ser selecionado se a API confirmar preço e desconto atuais
 - Nunca repetir o mesmo link dentro do mesmo dia
 """
-import os, json, datetime
+import os, json, datetime, re
 
 HISTORICO_PATH = os.path.expanduser("~/divulgacao/historico_ofertas.json")
+REPETICAO_COOLDOWN_DIAS = 30
+
+
+def _catalog_id(value):
+    """Extrai o ID do catálogo do caminho ou aceita um ID MLB literal."""
+    if not value:
+        return ""
+    text = str(value).strip()
+    if re.fullmatch(r"MLB\d{6,}", text, re.IGNORECASE):
+        return text.upper()
+    path = text.split("?", 1)[0]
+    m = re.search(r"/p/(MLB\d{6,})", path, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    return ""
 
 def carregar_historico():
     """Carrega o histórico de links já postados."""
@@ -29,17 +45,37 @@ def carregar_historico():
             return json.load(f)
     return {"links": {}, "dias": {}}
 
+def links_ja_postados_no_cooldown(links_por_data, hoje=None, cooldown_dias=REPETICAO_COOLDOWN_DIAS):
+    """Retorna links usados nos últimos N dias; datas inválidas são bloqueadas por segurança."""
+    hoje = hoje or datetime.date.today()
+    if not isinstance(links_por_data, dict):
+        return set()
+    ativos = set()
+    for link, valor_data in links_por_data.items():
+        if not link:
+            continue
+        try:
+            data_link = datetime.date.fromisoformat(str(valor_data)[:10])
+        except (TypeError, ValueError):
+            ativos.add(link)
+            continue
+        if (hoje - data_link).days < int(cooldown_dias):
+            ativos.add(link)
+    return ativos
+
+
 def salvar_historico(hist):
     with open(HISTORICO_PATH, "w") as f:
         json.dump(hist, f, ensure_ascii=False, indent=1)
 
-def registrar_posts(links_postados, data=None):
-    """Registra links postados no histórico (para não repetir amanhã)."""
+def registrar_posts(links_postados, data=None, links_canonicos=None):
+    """Registra links de afiliado e links de catálogo já publicados."""
     data = data or datetime.date.today().isoformat()
     hist = carregar_historico()
-    for link in links_postados:
-        if link:
-            hist["links"][link] = data
+    links_postados = [link for link in (links_postados or []) if link]
+    links_canonicos = [link for link in (links_canonicos or []) if link]
+    for link in set(links_postados + links_canonicos):
+        hist["links"][link] = data
     hist["dias"][data] = hist.get("dias", {}).get(data, 0) + len(links_postados)
     salvar_historico(hist)
     return len(links_postados)
@@ -71,11 +107,14 @@ def filtrar_por_metrica(ofertas, n_desejado=98, ja_postados=None):
     - Prioriza: 60% core, 20% médio, 10% oportunidade e 10% alto ticket
     """
     ja_postados = ja_postados or set()
-    # Remover já postados e produtos acima de R$ 7000
+    ja_postados_ids = {_catalog_id(x) for x in ja_postados}
+    ja_postados_ids.discard("")
+    # Remover links/IDs já publicados e produtos acima de R$ 7000
     candidatas = []
     for o in ofertas:
         link = o.get("link", "")
-        if link in ja_postados:
+        catalog_id = _catalog_id(o.get("catalog_id") or o.get("product_id") or link)
+        if link in ja_postados or (catalog_id and catalog_id in ja_postados_ids):
             continue
         p = o["preco"]
         desc = o.get("desconto") or 0

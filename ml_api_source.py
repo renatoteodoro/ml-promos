@@ -420,7 +420,8 @@ def _eligible_lowest_item(results):
 
 
 def buscar_ofertas_highlights(divulgacao_dir, history_links=(), extra_ids=(),
-                              limite_ofertas=300, max_produtos=6000,
+                              limite_ofertas=300,
+                              max_produtos=int(os.environ.get("PROMO_MAX_PRODUTOS", "900")),
                               cooldown_days=REPETICAO_COOLDOWN_DIAS,
                               termos_prioritarios=()):
     """Busca ofertas atuais com preço de catálogo, respeitando anti-repetição.

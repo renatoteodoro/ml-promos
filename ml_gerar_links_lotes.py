@@ -73,13 +73,9 @@ def main():
             page.goto("https://www.mercadolivre.com.br", timeout=30000, wait_until="domcontentloaded")
             ctx.add_cookies(cookies)
             print(f"🔐 {len(cookies)} cookies injetados")
-        # Abrir o gerador UMA vez
-        page.goto("https://www.mercadolivre.com.br/afiliados/hub?is_affiliate=true", timeout=45000, wait_until="domcontentloaded")
+        # Abrir o gerador UMA vez (nova URL: linkbuilder — portal remodelado em 08/2026)
+        page.goto("https://www.mercadolivre.com.br/afiliados/linkbuilder", timeout=45000, wait_until="domcontentloaded")
         page.wait_for_timeout(10000)
-        el = page.query_selector("text=Gerador de links")
-        if el:
-            el.click(force=True)
-            page.wait_for_timeout(8000)
 
         ta = page.query_selector("textarea:visible")
         if not ta:
