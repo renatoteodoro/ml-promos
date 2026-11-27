@@ -212,7 +212,27 @@ def buscar_98_ofertas(ja_postados=None, ids_postados=None,
         termos_prioritarios=termos_prioritarios,
     )
     print(f"  API oficial acrescentou {len(api_ofertas)} ofertas verificadas.")
-    return todas + api_ofertas
+    total = todas + api_ofertas
+
+    # CONTINGENCIA (27/11/2026): quando a API e a pagina /ofertas bloqueiam o IP da
+    # VPS, a vitrine do afiliado continua mostrando preco ao vivo. Sem isso o dia
+    # nasce com zero ofertas e o grupo fica em silencio.
+    if len(total) < MIN_FLOOR:
+        print(f"  🛰️ Coleta oficial rendeu {len(total)} (chão {MIN_FLOOR}); acionando a vitrine do afiliado.")
+        try:
+            from ml_vitrine_source import buscar_ofertas_vitrine
+            vitrine = buscar_ofertas_vitrine(
+                DIVULGACAO,
+                history_links=ja_postados,
+                extra_ids=ids_postados,
+                cooldown_days=cooldown_days,
+            )
+            print(f"  Vitrine acrescentou {len(vitrine)} ofertas com preço ao vivo.")
+            total = total + vitrine
+        except Exception as e:
+            print(f"  ⚠️ Vitrine indisponível: {type(e).__name__}: {str(e)[:90]}")
+
+    return total
 
 def gerar_cards_batch(ofertas):
     """Gera cards para todas as ofertas (uma sessão Playwright)."""
@@ -860,7 +880,10 @@ def main():
 
         # Dados vindos da API já têm preço do menor anúncio e desconto do mesmo vendedor.
         api_ofertas = [o for o in ofertas if str(o.get("fonte", "")).startswith("ml_api_")]
-        site_ofertas = [o for o in ofertas if not str(o.get("fonte", "")).startswith("ml_api_")]
+        vitrine_ofertas = [o for o in ofertas if o.get("fonte") == "vitrine_afiliado"]
+        site_ofertas = [o for o in ofertas
+                        if not str(o.get("fonte", "")).startswith("ml_api_")
+                        and o.get("fonte") != "vitrine_afiliado"]
         if site_ofertas:
             print("🔎 Comparando preços de catálogo nas ofertas do site...")
             site_ofertas = enriquecer_lote(site_ofertas)
@@ -870,7 +893,7 @@ def main():
                 site_ofertas = detectar_cupons_lote(site_ofertas)
             except Exception as e:
                 print(f"   ⚠️ Detecção de cupons falhou: {str(e)[:80]} (seguindo sem cupons)")
-        ofertas = site_ofertas + api_ofertas
+        ofertas = site_ofertas + api_ofertas + vitrine_ofertas
         dados = {"data": hoje, "ofertas": ofertas, "cards": [], "links": []}
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(dados, f, ensure_ascii=False, indent=1)
